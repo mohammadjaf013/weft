@@ -136,6 +136,34 @@ func TestWorkerCompletesJob(t *testing.T) {
 	}
 }
 
+// TestWorkerKeepsLeaseThroughRunning verifies a task keeps its lease_expires_at
+// after the worker flips it to running. A running task with a cleared lease
+// can never be recovered: RequeueExpired only touches rows with a non-null
+// lease, so a worker that dies mid-encode strands the task (and its job) in
+// "running" forever. The execute step must re-save the reserved task — the one
+// carrying the lease — not the original pre-reserve copy.
+func TestWorkerKeepsLeaseThroughRunning(t *testing.T) {
+	e := newWorkerEnv(t, &testPlugin{name: "v", kinds: []string{"video_encode"}})
+	ctx := context.Background()
+
+	job := core.Job{ID: "j1", Status: core.JobQueued, Priority: core.PriorityNormal, Profile: "test"}
+	if err := e.store.SaveJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	e.store.SaveTask(ctx, core.Task{ID: "t1", JobID: "j1", Kind: "video_encode", Status: core.TaskPending})
+
+	go e.worker.Run(e.ctx)
+	waitStatus(t, e, "j1", core.JobCompleted)
+
+	tk, _ := e.store.LoadTask(ctx, "t1")
+	if tk.Status != core.TaskDone {
+		t.Fatalf("task status = %s, want done", tk.Status)
+	}
+	if tk.LeaseExpiresAt == nil {
+		t.Fatal("lease_expires_at was cleared when the task ran — a crashed worker can never recover it")
+	}
+}
+
 // progressPlugin reports progress through the injected ProgressFunc.
 type progressPlugin struct{ name, kind string }
 

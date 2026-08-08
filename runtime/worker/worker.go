@@ -111,13 +111,14 @@ func (w *Worker) cycle(ctx context.Context) error {
 	}
 
 	// reserve a lease
-	if err := w.reserve(ctx, *task); err != nil {
+	reserved, err := w.reserve(ctx, *task)
+	if err != nil {
 		return err
 	}
-	return w.execute(ctx, *task)
+	return w.execute(ctx, reserved)
 }
 
-func (w *Worker) reserve(ctx context.Context, task core.Task) error {
+func (w *Worker) reserve(ctx context.Context, task core.Task) (core.Task, error) {
 	w.currentTask = string(task.ID)
 	w.lastHeartbeat = core.Now()
 
@@ -129,38 +130,38 @@ func (w *Worker) reserve(ctx context.Context, task core.Task) error {
 	started := core.Now()
 	task.StartedAt = &started
 	if err := w.opts.Store.SaveTask(ctx, task); err != nil {
-		return err
+		return task, err
 	}
 
 	// job-level: reserved (first time) → running → (uploading for upload tasks)
 	job, err := w.opts.Store.LoadJob(ctx, task.JobID)
 	if err != nil {
-		return err
+		return task, err
 	}
 	switch job.Status {
 	case core.JobQueued:
 		if err := w.opts.SM.Transition(ctx, job.ID, core.JobReserved, ""); err != nil {
-			return err
+			return task, err
 		}
 		fallthrough
 	case core.JobReserved:
 		if err := w.opts.SM.Transition(ctx, job.ID, core.JobRunning, ""); err != nil {
-			return err
+			return task, err
 		}
 		fallthrough
 	case core.JobRunning:
 		// upload-phase tasks move the job into the uploading state
 		if task.Kind == "upload" {
 			if err := w.opts.SM.Transition(ctx, job.ID, core.JobUploading, ""); err != nil {
-				return err
+				return task, err
 			}
 		}
 	case core.JobPaused:
 		if err := w.opts.SM.Transition(ctx, job.ID, core.JobResumed, ""); err != nil {
-			return err
+			return task, err
 		}
 	}
-	return nil
+	return task, nil
 }
 
 // supervise watches job status while a task executes. When the operator pauses
