@@ -73,7 +73,7 @@ func remoteFlagSet(name string) *flag.FlagSet {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.String("api", "", "API base URL (default from config network.listen)")
 	fs.String("key", "", "bearer token (default from config security.admin_api_key)")
-	fs.String("config", "weft.yaml", "path to config file")
+	fs.String("config", "", "path to config file (default: auto-discover weft.yaml in cwd, /opt/weft, /etc/weft, ~/.weft, ~)")
 	return fs
 }
 

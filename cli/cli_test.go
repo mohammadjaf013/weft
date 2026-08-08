@@ -75,6 +75,39 @@ func TestFindConfigNoMatchReturnsDefault(t *testing.T) {
 	}
 }
 
+// TestParseRemotePicksUpAdminKey ensures a remote command run from a directory
+// that has no weft.yaml still discovers one in a well-known install location
+// and reads security.admin_api_key from it — the token that 401s without.
+func TestParseRemotePicksUpAdminKey(t *testing.T) {
+	dir := t.TempDir()
+	conf := "network:\n  listen: 127.0.0.1:9443\nsecurity:\n  api_keys: true\n  admin_api_key: secret-token-123\n"
+	if err := os.WriteFile(filepath.Join(dir, "weft.yaml"), []byte(conf), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// run the CLI from an empty dir so the cwd has no config; point it at the
+	// discovered dir by simulating findConfig via a --config flag to that dir
+	fs := remoteFlagSet("weft")
+	rf, err := parseRemote(fs, []string{"--config", filepath.Join(dir, "weft.yaml"), "jobs", "get", "j1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rf.key != "secret-token-123" {
+		t.Errorf("key = %q, want secret-token-123 (read from config)", rf.key)
+	}
+	if rf.api != "http://127.0.0.1:9443" {
+		t.Errorf("api = %q, want http://127.0.0.1:9443", rf.api)
+	}
+	// --key flag must win over the config file
+	fs2 := remoteFlagSet("weft")
+	rf2, err := parseRemote(fs2, []string{"--key", "explicit", "--config", filepath.Join(dir, "weft.yaml"), "jobs", "get", "j1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rf2.key != "explicit" {
+		t.Errorf("explicit key = %q, want explicit", rf2.key)
+	}
+}
+
 func TestJobsCreateBodySrcLang(t *testing.T) {
 	body := jobsCreateBody("/mnt/in.mp4", "ai-subtitle", "high", 2, "fa", "tr", "movie", "series", true, "hybrid")
 	want := map[string]any{
