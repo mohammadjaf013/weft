@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/assets/weft-banner.png" alt="Weft" width="480">
+
 # Weft
 
 **A self-hosted media processing agent.** Feed it a video once — get the fully packaged output: H.264/HEVC HLS ladder, thumbnails, subtitles (incl. AI), master playlist, and upload to any storage.
@@ -242,13 +244,37 @@ GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "-s -w" -o dist/weft-lin
 
 ---
 
+## Vision
+
+Weft is becoming an orchestration layer specifically designed for video and audio workloads — a Kubernetes-like platform for multimedia infrastructure. The goal is to make multimedia infrastructure as programmable, scalable, and reliable as modern cloud infrastructure: an infrastructure layer where companies can run video, audio, streaming, and AI media workloads without having to build their own orchestration platform from scratch.
+
+---
+
+## Roadmap
+
+Weft already supports core media-processing workflows, including distributed FFmpeg processing, HLS generation, subtitles, thumbnails, encryption, and AI-powered subtitle processing. The roadmap is focused on expanding these capabilities while building the infrastructure underneath them:
+
+- **Distributed Media Orchestration** — reliable scheduling and execution of multimedia workloads across multiple servers.
+- **Resource-Aware Scheduling** — intelligent scheduling based on CPU, RAM, disk, GPU, concurrency, and worker availability.
+- **Advanced Job Management** — priorities, retries, pause/resume, crash recovery, dependencies, persistent state, and automatic workload redistribution.
+- **AI Subtitle & Localization** — expanding the existing AI subtitle capabilities into automatic transcription, translation, subtitle synchronization, quality improvement, and multi-language localization workflows.
+- **AI Media Processing** — AI-powered workflows for speech detection, audio enhancement, scene analysis, metadata generation, content understanding, and automated media enrichment.
+- **Advanced Video Processing** — encoding pipelines, HLS/DASH packaging, multiple quality profiles, thumbnails, previews, audio processing, encryption, and automated media optimization.
+- **GPU Workloads** — GPU-aware scheduling and AI/video workloads that require dedicated GPU resources.
+- **Media Workflow Pipelines** — complex processing workflows defined as reusable pipelines with dependencies between jobs.
+- **Observability & Operations** — real-time monitoring, metrics, logs, worker health, resource usage, job progress, and failure analysis.
+- **Storage & Cloud Integrations** — flexible integration with S3-compatible storage, local storage, object storage, and different deployment environments.
+- **Kubernetes-like Multimedia Orchestration** — an orchestration layer that brings the concepts of scheduling, workers, resources, scaling, and recovery to multimedia infrastructure.
+
+---
+
 ## Documentation
 
 - [docs/README.md](docs/README.md) — architecture overview
 - [docs/REFERENCE.md](docs/REFERENCE.md) — complete reference manual (config, CLI, API, webhooks, AI subtitles)
-- [docs/SETUP-FA.md](docs/SETUP-FA.md) — setup, configuration, deployment (فارسی)
-- [docs/GUIDE-FA.md](docs/GUIDE-FA.md) — user guide (فارسی)
-- [docs/CLI-API-FA.md](docs/CLI-API-FA.md) — CLI + API reference (فارسی)
+- [docs/SETUP-FA.md](docs/SETUP-FA.md) — setup, configuration, deployment
+- [docs/GUIDE-FA.md](docs/GUIDE-FA.md) — user guide
+- [docs/CLI-API-FA.md](docs/CLI-API-FA.md) — CLI + API reference
 
 ---
 
