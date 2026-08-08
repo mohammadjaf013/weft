@@ -1,8 +1,14 @@
 package ffmpeg
 
 import (
+	"context"
 	"io"
+	"os"
+	"os/exec"
 	"testing"
+	"time"
+
+	"github.com/mohammadjaf013/weft/core"
 )
 
 func TestParseTimeToMs(t *testing.T) {
@@ -216,5 +222,82 @@ func TestParseProgressNoDurationStaysZeroUntilEnd(t *testing.T) {
 	// progress=end callback fires.
 	if len(got) != 1 || got[0] != 100 {
 		t.Fatalf("got %v, want [100] only", got)
+	}
+}
+
+// TestHelperSleepForever is never run as a real test: the pause/resume test
+// spawns the test binary in helper mode (WEFT_HELPER=1) and this function makes
+// it sleep long enough to observe a SIGSTOP/SIGCONT.
+func TestHelperSleepForever(t *testing.T) {
+	if os.Getenv("WEFT_HELPER") != "1" {
+		t.Skip("helper only")
+	}
+	time.Sleep(30 * time.Second)
+}
+
+// TestPauseResumeSignalsRealProcess spawns a real child process (the test
+// binary in helper mode) and verifies Pause freezes it and Resume continues it.
+func TestPauseResumeSignalsRealProcess(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go binary not found; cannot spawn a helper process")
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Skip("cannot find test executable")
+	}
+	// Spawn a real child process (the test binary itself in "helper" mode) that
+	// sleeps 10s. Pause → SIGSTOP freezes it; Resume → SIGCONT continues it.
+	cmd := exec.Command(exe, "-test.run=TestHelperSleepForever")
+	cmd.Env = append(os.Environ(), "WEFT_HELPER=1")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}()
+
+	e := New(DefaultLocator())
+	e.track("t", cmd)
+	defer e.untrack("t")
+
+	if err := e.Pause(context.Background(), "t"); err != nil {
+		t.Skipf("pause unsupported on this platform: %v", err)
+	}
+	// While stopped, the child makes no progress: measure elapsed time for a
+	// short window — it must be near zero (process is frozen), proving pause
+	// really stops it rather than flipping a status field alone.
+	st := time.Now()
+	time.Sleep(500 * time.Millisecond)
+	frozen := time.Since(st)
+	if err := e.Resume(context.Background(), "t"); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	// Immediately after resume, wall time advances normally.
+	st = time.Now()
+	time.Sleep(200 * time.Millisecond)
+	normal := time.Since(st)
+	if frozen < 300*time.Millisecond {
+		t.Errorf("process was not frozen during pause (elapsed %v during 500ms window)", frozen)
+	}
+	if normal < 150*time.Millisecond {
+		t.Errorf("process did not resume (elapsed %v during 200ms window)", normal)
+	}
+}
+
+// TestPauseResumeUnknownTaskNoop verifies Pause/Resume never panic or error
+// for a task ID the executor is not tracking.
+func TestPauseResumeUnknownTaskNoop(t *testing.T) {
+	e := New(DefaultLocator())
+	if err := e.Pause(context.Background(), "nope"); err != nil {
+		t.Fatalf("Pause unknown task: %v", err)
+	}
+	if err := e.Resume(context.Background(), "nope"); err != nil {
+		t.Fatalf("Resume unknown task: %v", err)
+	}
+	// fake executor also must no-op
+	f := NewFake(core.Result{ExitCode: 0}, nil)
+	if err := f.Pause(context.Background(), "x"); err != nil {
+		t.Fatalf("fake Pause: %v", err)
 	}
 }

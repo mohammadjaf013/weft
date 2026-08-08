@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/mohammadjaf013/weft/core"
@@ -32,6 +33,12 @@ type Options struct {
 	// read (e.g. local:/abs/path.mp4 → /abs/path.mp4). If nil, InputURI is left
 	// empty and plugins that require a resolvable input fail fast.
 	InputResolver func(job core.Job) (string, error)
+	// Gate is a resource-aware scheduling hook: the worker only picks a task up
+	// when Gate() returns true (and nil means "always pick"). Used to keep the
+	// host under scheduler.max_cpu_percent / max_load_average: when over the
+	// threshold the worker idles and leaves the task in the queue instead of
+	// making the machine slower for everyone.
+	Gate func() bool
 }
 
 // OutputStore is the optional persistence needed to feed the upload task.
@@ -88,8 +95,13 @@ func (w *Worker) Run(ctx context.Context) error {
 	}
 }
 
-// cycle performs one scheduling step.
+// cycle performs one scheduling step. When a resource Gate is configured and
+// the host is over its threshold, the worker skips this cycle and leaves the
+// queued task for later instead of competing for saturated CPU.
 func (w *Worker) cycle(ctx context.Context) error {
+	if w.opts.Gate != nil && !w.opts.Gate() {
+		return nil
+	}
 	task, err := w.opts.Sched.NextReady(ctx)
 	if err != nil {
 		return err
@@ -149,6 +161,54 @@ func (w *Worker) reserve(ctx context.Context, task core.Task) error {
 		}
 	}
 	return nil
+}
+
+// supervise watches job status while a task executes. When the operator pauses
+// the job it signals the executor to stop the running process; when the job
+// leaves paused it resumes. Executors without core.ProcessController (fakes,
+// remote executors) get no process-level signal — pause degrades to the state
+// machine only. Returns a stop func to detach the goroutine when the plugin
+// returns.
+func (w *Worker) supervise(ctx context.Context, task core.Task) func() {
+	ctrl, ok := w.opts.Executor.(core.ProcessController)
+	if !ok {
+		return func() {}
+	}
+	quit := make(chan struct{})
+	var once sync.Once
+	stop := func() { once.Do(func() { close(quit) }) }
+	interval := w.opts.Interval
+	if interval <= 0 {
+		interval = 500 * time.Millisecond
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-quit:
+				return
+			case <-ticker.C:
+			}
+			job, err := w.opts.Store.LoadJob(ctx, task.JobID)
+			if err != nil {
+				continue
+			}
+			switch job.Status {
+			case core.JobPaused:
+				if err := ctrl.Pause(ctx, task.ID); err != nil && w.opts.Bus != nil {
+					log.Printf("worker %s pause task %s: %v", w.id, task.ID, err)
+				}
+			case core.JobResumed, core.JobRunning:
+				if err := ctrl.Resume(ctx, task.ID); err != nil && w.opts.Bus != nil {
+					log.Printf("worker %s resume task %s: %v", w.id, task.ID, err)
+				}
+			}
+		}
+	}()
+	return stop
 }
 
 // buildProgress returns a throttled ProgressFunc: it persists every update to
@@ -263,7 +323,14 @@ func (w *Worker) execute(ctx context.Context, task core.Task) error {
 		return err
 	}
 
+	// While the plugin runs (blocking on Executor.Run → ffmpeg), a background
+	// supervisor watches the job status so Pause/Resume reach the OS process:
+	// a job flipped to "paused" freezes the transcode (SIGSTOP), coming back
+	// out continues it (SIGCONT). The caller blocks here, so the supervisor
+	// runs in its own goroutine until the plugin returns.
+	stopSupervise := w.supervise(ctx, task)
 	out, err := w.opts.Registry.Process(ctx, task.Kind, in)
+	stopSupervise()
 	if err != nil {
 		w.opts.Sched.MarkFailed(ctx, task.ID, err)
 		w.currentTask = ""

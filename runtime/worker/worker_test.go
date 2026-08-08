@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -301,4 +302,145 @@ func (p *uriRecorder) Capabilities() core.Capabilities {
 func (p *uriRecorder) Process(_ context.Context, in core.TaskInput) (core.TaskOutput, error) {
 	p.seenURI = in.InputURI
 	return core.TaskOutput{}, nil
+}
+
+// TestWorkerGateBlocksScheduling verifies the resource gate keeps a ready task
+// in the queue until the host is under the threshold again.
+func TestWorkerGateBlocksScheduling(t *testing.T) {
+	e := newWorkerEnv(t, &testPlugin{name: "v", kinds: []string{"video_encode"}})
+	e.worker.opts.Gate = func() bool { return false } // host saturated
+	ctx := context.Background()
+
+	job := core.Job{ID: "jg", Status: core.JobQueued, Priority: core.PriorityNormal, Profile: "test"}
+	if err := e.store.SaveJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	e.store.SaveTask(ctx, core.Task{ID: "tg", JobID: "jg", Kind: "video_encode", Status: core.TaskPending})
+
+	go e.worker.Run(e.ctx)
+
+	// give the worker a few cycles — the task must NOT be leased while gated
+	time.Sleep(200 * time.Millisecond)
+	tk, _ := e.store.LoadTask(ctx, "tg")
+	if tk.Status != core.TaskPending {
+		t.Fatalf("gated task was picked up: status = %s, want pending", tk.Status)
+	}
+
+	// open the gate; the task should now be processed
+	e.worker.opts.Gate = func() bool { return true }
+	waitStatus(t, e, "jg", core.JobCompleted)
+}
+
+// pauseRecorder is a fake executor that also implements core.ProcessController
+// so the worker's supervisor can pause/resume it.
+type pauseRecorder struct {
+	mu      sync.Mutex
+	pauses  int
+	resumes int
+}
+
+func (f *pauseRecorder) Run(ctx context.Context, task core.Task, in core.TaskInput) (core.Result, error) {
+	return core.Result{ExitCode: 0}, nil
+}
+func (f *pauseRecorder) Probe(ctx context.Context, path string) (core.MediaInfo, error) {
+	return core.MediaInfo{}, nil
+}
+func (f *pauseRecorder) Pause(ctx context.Context, taskID core.TaskID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pauses++
+	return nil
+}
+func (f *pauseRecorder) Resume(ctx context.Context, taskID core.TaskID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.resumes++
+	return nil
+}
+
+func (f *pauseRecorder) counts() (int, int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.pauses, f.resumes
+}
+
+// TestWorkerPauseResumeSignals verifies that pausing a job while a task is
+// running reaches the executor (real process stop) and resuming continues it.
+func TestWorkerPauseResumeSignals(t *testing.T) {
+	store, err := sqlite.OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bus := core.NewEventBus()
+	sm := core.NewStateMachine(store, bus)
+	sched := core.NewDAGScheduler(store, bus, sm)
+	reg := registry.New()
+	if err := reg.Register(&testPlugin{name: "v", kinds: []string{"video_encode"}, delay: 300 * time.Millisecond}); err != nil {
+		t.Fatal(err)
+	}
+	rec := &pauseRecorder{}
+
+	// The testPlugin honors ctx.Done, so a real pause would suspend ffmpeg; the
+	// recorder just counts Pause/Resume calls. Give the job enough time to be
+	// observed in both states while the plugin still runs.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := New("pause-1", Options{
+		Store:    store,
+		Bus:      bus,
+		Sched:    sched,
+		SM:       sm,
+		Registry: reg,
+		Executor: rec,
+		LeaseTTL: time.Minute,
+		Interval: 20 * time.Millisecond,
+	})
+	t.Cleanup(func() {
+		cancel()
+		bus.Close()
+		store.Close()
+	})
+
+	cjob := core.Job{ID: "jp", Status: core.JobQueued, Priority: core.PriorityNormal, Profile: "test"}
+	if err := store.SaveJob(ctx, cjob); err != nil {
+		t.Fatal(err)
+	}
+	store.SaveTask(ctx, core.Task{ID: "tp", JobID: "jp", Kind: "video_encode", Status: core.TaskPending})
+
+	go w.Run(ctx)
+	waitStatus(t, &env{store: store, worker: w}, "jp", core.JobRunning)
+
+	// pause while the plugin still runs → executor.Pause must be hit
+	if err := sm.Transition(ctx, "jp", core.JobPaused, "test"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.After(2 * time.Second)
+	for {
+		p, _ := rec.counts()
+		if p >= 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("executor.Pause was never called during job pause")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+
+	// resume → executor.Resume must be hit
+	if err := sm.Transition(ctx, "jp", core.JobResumed, "test"); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.After(2 * time.Second)
+	for {
+		_, r := rec.counts()
+		if r >= 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("executor.Resume was never called during job resume")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
 }

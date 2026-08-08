@@ -33,14 +33,18 @@ func (p *Plugin) Process(ctx context.Context, in core.TaskInput) (core.TaskOutpu
 	if c, ok := in.Params["codec"].(string); ok && c != "" {
 		codec = c
 	}
+	switch codec {
+	case "h264", "hevc":
+	default:
+		return core.TaskOutput{}, fmt.Errorf("video_encode: unsupported codec %q (want h264|hevc)", codec)
+	}
 	outDir, err := mediautil.EnsureWorkDir(in)
 	if err != nil {
 		return core.TaskOutput{}, err
 	}
 	base := mediautil.BaseName(in)
 	ladder := mediautil.DefaultH264Ladder
-	args := mediautil.H264MultiArgs(in.InputURI, ladder, outDir, base)
-	_ = codec
+	args := mediautil.EncodeMultiArgs(in.InputURI, ladder, outDir, base, codec)
 
 	in.Params["argv"] = args
 

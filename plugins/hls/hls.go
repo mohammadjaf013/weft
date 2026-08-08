@@ -58,10 +58,14 @@ func (p *Plugin) Process(ctx context.Context, in core.TaskInput) (core.TaskOutpu
 		if l, ok := in.Params["ladder"].([]string); ok && len(l) > 0 {
 			ladder = mediautil.LadderFromLabels(l)
 		}
+		codec := "h264"
+		if c, _ := in.Params["codec"].(string); c == "hevc" {
+			codec = "hevc"
+		}
 		// single-pass: decode once, write every rendition + a master playlist
-		in.Params["argv"] = mediautil.HLSMultiArgs(in.InputURI, ladder, outDir, base, 6, hasAudio)
+		in.Params["argv"] = mediautil.HLSMultiArgsCodec(in.InputURI, ladder, outDir, base, 6, hasAudio, codec)
 		frameRate := mediautil.FrameRate(in)
-		if err := mediautil.WriteFile(filepath.Join(outDir, "playlist.m3u8"), mediautil.MasterPlaylist(ladder, frameRate)); err != nil {
+		if err := mediautil.WriteFile(filepath.Join(outDir, "playlist.m3u8"), mediautil.MasterPlaylistCodec(ladder, frameRate, codec)); err != nil {
 			return core.TaskOutput{}, err
 		}
 	}

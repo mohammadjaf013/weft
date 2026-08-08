@@ -89,7 +89,7 @@ func TestRebuildWritesMaster(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	p, err := Rebuild(context.Background(), st)
+	p, err := Rebuild(context.Background(), st, "h264")
 	if err != nil {
 		t.Fatalf("Rebuild: %v", err)
 	}
@@ -105,5 +105,26 @@ func TestRebuildWritesMaster(t *testing.T) {
 	}
 	if !strings.Contains(string(b), "audio/tr/x.m3u8") {
 		t.Errorf("master missing audio uri:\n%s", b)
+	}
+	if !strings.Contains(string(b), "avc1.") {
+		t.Errorf("master should advertise avc1 codec for h264:\n%s", b)
+	}
+}
+
+func TestRebuildWritesHevcMaster(t *testing.T) {
+	dir := t.TempDir()
+	st, err := local.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "360p.m3u8"), []byte("#EXTM3U\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p, err := Rebuild(context.Background(), st, "hevc")
+	if err != nil {
+		t.Fatalf("Rebuild: %v", err)
+	}
+	if !strings.Contains(p.Master, "hvc1.") {
+		t.Errorf("master should advertise hvc1 codec for hevc:\n%s", p.Master)
 	}
 }

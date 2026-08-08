@@ -89,13 +89,14 @@ func Discover(files []string) (Plan, error) {
 		Renditions: rends,
 		Subtitles:  subs,
 		Audios:     auds,
-		Master:     Render(rends, subs, auds),
+		Master:     Render(rends, subs, auds, "h264"),
 	}
 	return p, nil
 }
 
-// Render builds a complete master playlist from the discovered pieces.
-func Render(rends []string, subs, auds []Track) string {
+// Render builds a complete master playlist from the discovered pieces. codec
+// controls the video CODECS tag ("h264" → avc1.*, "hevc" → hvc1.*).
+func Render(rends []string, subs, auds []Track, codec string) string {
 	ladder := mediautil.LadderFromLabels(rends)
 	var b strings.Builder
 	b.WriteString("#EXTM3U\n")
@@ -115,7 +116,7 @@ func Render(rends []string, subs, auds []Track) string {
 		audGroup = ""
 	}
 	for _, r := range ladder {
-		line := mediautil.StreamInf(r, 0)
+		line := mediautil.StreamInfCodec(r, 0, codec)
 		if subGroup != "" {
 			line += ",SUBTITLES=\"" + subGroup + "\""
 		}
@@ -142,8 +143,12 @@ func mediaLine(typ, group string, t Track) string {
 }
 
 // Rebuild regenerates the master playlist in place for the given storage and
-// returns the resulting plan.
-func Rebuild(ctx context.Context, st core.Storage) (Plan, error) {
+// returns the resulting plan. codec selects the video CODECS tag in the master
+// ("h264" → avc1.*, "hevc" → hvc1.*); empty defaults to h264.
+func Rebuild(ctx context.Context, st core.Storage, codec string) (Plan, error) {
+	if codec != "hevc" {
+		codec = "h264"
+	}
 	files, err := st.List(ctx)
 	if err != nil {
 		return Plan{}, fmt.Errorf("rebuild: list storage: %w", err)
@@ -152,6 +157,7 @@ func Rebuild(ctx context.Context, st core.Storage) (Plan, error) {
 	if err != nil {
 		return Plan{}, err
 	}
+	p.Master = Render(p.Renditions, p.Subtitles, p.Audios, codec)
 	ref := core.AssetRef{Kind: "playlist", Name: "playlist.m3u8"}
 	if err := st.Save(ctx, ref, strings.NewReader(p.Master)); err != nil {
 		return Plan{}, fmt.Errorf("rebuild: write master: %w", err)

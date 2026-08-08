@@ -34,9 +34,18 @@ type Executor struct {
 	loc CommandLocator
 	// fake short-circuits Run in tests so no external binary is needed.
 	fake *fakeRunner
+	// running tracks the OS process currently supervising a task, keyed by task
+	// ID, so Pause/Resume can signal it while Run is in flight.
+	mu      sync.Mutex
+	running map[core.TaskID]*processHandle
 }
 
 var _ core.Executor = (*Executor)(nil)
+
+// processHandle wraps the exec.Cmd for one running task.
+type processHandle struct {
+	cmd *exec.Cmd
+}
 
 type fakeRunner struct {
 	mu          sync.Mutex
@@ -105,6 +114,7 @@ func (e *Executor) Run(ctx context.Context, task core.Task, in core.TaskInput) (
 	if err := cmd.Start(); err != nil {
 		return core.Result{}, err
 	}
+	e.track(in.TaskID, cmd)
 
 	go e.parseProgress(stdout, in.Progress, durationMS)
 
@@ -114,13 +124,66 @@ func (e *Executor) Run(ctx context.Context, task core.Task, in core.TaskInput) (
 		if ee, ok := err.(*exec.ExitError); ok {
 			res.ExitCode = ee.ExitCode()
 		} else {
+			e.untrack(in.TaskID)
 			return res, err
 		}
 	}
+	e.untrack(in.TaskID)
 	if res.ExitCode != 0 {
 		return res, fmt.Errorf("ffmpeg exited with code %d", res.ExitCode)
 	}
 	return res, nil
+}
+
+// track registers the running command so Pause/Resume can reach it by task ID.
+func (e *Executor) track(taskID core.TaskID, cmd *exec.Cmd) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.running == nil {
+		e.running = map[core.TaskID]*processHandle{}
+	}
+	e.running[taskID] = &processHandle{cmd: cmd}
+}
+
+// untrack removes the process once Run finishes.
+func (e *Executor) untrack(taskID core.TaskID) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.running, taskID)
+}
+
+// lookup returns the handle for a running task, or nil if it is unknown.
+func (e *Executor) lookup(taskID core.TaskID) *processHandle {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.running[taskID]
+}
+
+// Pause implements core.ProcessController: it stops the running ffmpeg process
+// (SIGSTOP on unix) so a paused job actually halts the transcode instead of
+// just changing the status.
+func (e *Executor) Pause(ctx context.Context, taskID core.TaskID) error {
+	if e.fake != nil {
+		return nil
+	}
+	h := e.lookup(taskID)
+	if h == nil || h.cmd.Process == nil {
+		return nil
+	}
+	return e.signalStop(h.cmd.Process)
+}
+
+// Resume implements core.ProcessController: it continues the stopped process
+// (SIGCONT on unix).
+func (e *Executor) Resume(ctx context.Context, taskID core.TaskID) error {
+	if e.fake != nil {
+		return nil
+	}
+	h := e.lookup(taskID)
+	if h == nil || h.cmd.Process == nil {
+		return nil
+	}
+	return e.signalCont(h.cmd.Process)
 }
 
 // parseProgress reads ffmpeg's `-progress pipe:1` key=value stream and turns

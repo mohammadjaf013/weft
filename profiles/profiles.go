@@ -55,6 +55,9 @@ var Profiles = map[string]Profile{
 			{From: "subtitle", To: "upload"},
 			{From: "hls", To: "upload"},
 		},
+		Params: map[string]map[string]any{
+			"hls": {"ladder": []string{"360p", "480p", "720p", "1080p"}, "codec": "hevc"},
+		},
 	},
 	"audio": {
 		Name:        "audio",

@@ -537,6 +537,17 @@ low → background`.
 
 Task states: `pending → ready → leased → running → done` (or `failed`).
 
+Resource-aware scheduling (`scheduler.max_cpu_percent` / `max_load_average`):
+when either threshold is set, every worker consults the host snapshot before
+picking up a new task. If the machine is already over the ceiling, the worker
+idles and the task stays queued — the pipeline never piles more encodes onto a
+saturated host. Thresholds of 0 (the default) disable the gate.
+
+Pause/Resume are **real**, not cosmetic: pausing a running job stops the actual
+`ffmpeg` process (SIGSTOP on Linux; on platforms without POSIX signals the job
+state still flips but the child keeps running), and resuming continues it
+(SIGCONT). Pausing while a task is queued simply holds it until resume.
+
 Durability model:
 
 - Every state transition **and** its event commit in **one** SQLite

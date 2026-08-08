@@ -17,6 +17,7 @@ import (
 	"github.com/mohammadjaf013/weft/plugins/mediautil"
 	"github.com/mohammadjaf013/weft/plugins/storage/local"
 	"github.com/mohammadjaf013/weft/runtime/store/sqlite"
+	"github.com/mohammadjaf013/weft/runtime/sysinfo"
 	"github.com/mohammadjaf013/weft/runtime/webhook"
 	"github.com/mohammadjaf013/weft/runtime/worker"
 )
@@ -69,7 +70,8 @@ func (d *Daemon) Serve(ctx context.Context) error {
 		expirer(ctx, d.store, 2*time.Second)
 	}()
 
-	// workers
+	// workers. A resource gate idles workers when the host exceeds the
+	// scheduler thresholds, so the queue stays put instead of saturating CPU.
 	min := d.cfg.Workers.Min
 	if min <= 0 {
 		min = 1
@@ -77,6 +79,17 @@ func (d *Daemon) Serve(ctx context.Context) error {
 	leaseTTL := 5 * time.Minute
 	if d.cfg.Workers.LeaseTTLSeconds > 0 {
 		leaseTTL = time.Duration(d.cfg.Workers.LeaseTTLSeconds) * time.Second
+	}
+	var gate *sysinfo.Gate
+	if d.cfg.Scheduler.MaxCPUPercent > 0 || d.cfg.Scheduler.MaxLoadAvg > 0 {
+		gate = &sysinfo.Gate{
+			MaxCPUPercent: d.cfg.Scheduler.MaxCPUPercent,
+			MaxLoadAvg:    d.cfg.Scheduler.MaxLoadAvg,
+		}
+	}
+	var gateAllow func() bool
+	if gate != nil {
+		gateAllow = gate.Allow
 	}
 	for i := 0; i < min; i++ {
 		w := worker.New(fmt.Sprintf("w%d", i), worker.Options{
@@ -90,6 +103,7 @@ func (d *Daemon) Serve(ctx context.Context) error {
 			OutputStore:   d.store,
 			LeaseTTL:      leaseTTL,
 			InputResolver: d.resolveInputOr,
+			Gate:          gateAllow,
 		})
 		d.pool.add(w)
 		d.wg.Add(1)

@@ -52,6 +52,62 @@ func TestProcessBuildsLadderAndReportsAssets(t *testing.T) {
 	}
 }
 
+func TestProcessHonorsCodecParam(t *testing.T) {
+	mediautil.WorkRoot = t.TempDir()
+
+	for _, tc := range []struct {
+		codec    string
+		wantLibc string
+	}{
+		{"h264", "libx264"},
+		{"hevc", "libx265"},
+	} {
+		fake := ffexec.NewFake(core.Result{ExitCode: 0}, nil)
+		in := core.TaskInput{
+			JobID:    "job-1",
+			TaskID:   "task-1",
+			Kind:     "video_encode",
+			InputRef: "s3://in/movie.mp4",
+			InputURI: "local:work/movie.mp4",
+			Params:   map[string]any{"codec": tc.codec},
+			Executor: fake,
+		}
+		if _, err := (&Plugin{}).Process(context.Background(), in); err != nil {
+			t.Fatalf("codec %s: Process: %v", tc.codec, err)
+		}
+		args := fake.RecordedArgs()
+		if len(args) != 1 {
+			t.Fatalf("codec %s: expected 1 exec, got %d", tc.codec, len(args))
+		}
+		if !containsStr(args[0], "-c:v") || !containsStr(args[0], tc.wantLibc) {
+			t.Errorf("codec %s: argv must encode with %s: %v", tc.codec, tc.wantLibc, args[0])
+		}
+	}
+}
+
+func TestProcessRejectsUnknownCodec(t *testing.T) {
+	mediautil.WorkRoot = t.TempDir()
+	_, err := (&Plugin{}).Process(context.Background(), core.TaskInput{
+		TaskID:   "t1",
+		InputRef: "s3://in/movie.mp4",
+		InputURI: "local:work/movie.mp4",
+		Params:   map[string]any{"codec": "vp9"},
+		Executor: ffexec.NewFake(core.Result{}, nil),
+	})
+	if err == nil {
+		t.Fatal("expected error for unsupported codec")
+	}
+}
+
+func containsStr(xs []string, want string) bool {
+	for _, x := range xs {
+		if x == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestProcessErrorsWithoutInput(t *testing.T) {
 	mediautil.WorkRoot = t.TempDir()
 	_, err := (&Plugin{}).Process(context.Background(), core.TaskInput{

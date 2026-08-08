@@ -705,6 +705,7 @@ func (s *Server) handleRebuildMaster(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		DestinationID int    `json:"destination_id"`
 		Path          string `json:"path"`
+		Codec         string `json:"codec"` // "h264" (default) or "hevc"
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", "malformed JSON body")
@@ -715,7 +716,7 @@ func (s *Server) handleRebuildMaster(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	p, err := rebuild.Rebuild(r.Context(), st)
+	p, err := rebuild.Rebuild(r.Context(), st, req.Codec)
 	if err != nil {
 		writeError(w, http.StatusUnprocessableEntity, "rebuild_failed", err.Error())
 		return

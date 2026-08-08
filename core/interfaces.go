@@ -106,10 +106,21 @@ type OutboxRow struct {
 }
 
 type Executor interface {
-	// One call per Task. Core never knows this runs ffmpeg.
+	// One call per task runs the executor plugin.
 	Run(ctx context.Context, task Task, in TaskInput) (Result, error)
 	// Probe reads media metadata from an input file.
 	Probe(ctx context.Context, path string) (MediaInfo, error)
+}
+
+// ProcessController is the optional executor extension that makes pause/resume
+// real: the worker asks the executor to stop (SIGSTOP) or continue (SIGCONT)
+// the OS process a task is currently running, instead of only flipping the
+// job's status. Executors without a long-running child process (fakes in tests,
+// remote executors) simply don't implement it and the worker treats pause as a
+// no-op at the process level, which is a strict improvement for this executor.
+type ProcessController interface {
+	Pause(ctx context.Context, taskID TaskID) error
+	Resume(ctx context.Context, taskID TaskID) error
 }
 
 type Result struct {
