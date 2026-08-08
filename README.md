@@ -245,6 +245,7 @@ GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "-s -w" -o dist/weft-lin
 ## Documentation
 
 - [docs/README.md](docs/README.md) — architecture overview
+- [docs/REFERENCE.md](docs/REFERENCE.md) — complete reference manual (config, CLI, API, webhooks, AI subtitles)
 - [docs/SETUP-FA.md](docs/SETUP-FA.md) — setup, configuration, deployment (فارسی)
 - [docs/GUIDE-FA.md](docs/GUIDE-FA.md) — user guide (فارسی)
 - [docs/CLI-API-FA.md](docs/CLI-API-FA.md) — CLI + API reference (فارسی)
