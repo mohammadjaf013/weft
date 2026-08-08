@@ -82,6 +82,9 @@ func TestGateSelfCPUThreshold(t *testing.T) {
 		now := func() (float64, error) { i++; return 0.25 * float64(i), nil } // tiny cumulative time
 		g := &Gate{MaxCPUPercent: 85, cpuNow: now}
 		g.decide() // baseline
+		// fix the window to 1s so the tiny delta stays tiny regardless of the
+		// platform clock resolution: pct = 0.25/1/NumCPU*100, well under 85.
+		g.cpuAt = g.cpuAt.Add(-time.Second)
 		if !g.decide() {
 			t.Fatal("negligible self cpu must allow")
 		}

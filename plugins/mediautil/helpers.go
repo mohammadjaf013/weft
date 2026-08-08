@@ -79,8 +79,12 @@ func FrameRate(in core.TaskInput) float64 {
 // BaseName derives a stable file base from the input ref: s3://in/movie.mp4 → "movie".
 func BaseName(in core.TaskInput) string {
 	ref := in.InputRef
-	base := filepath.Base(ref)
-	base = strings.TrimSuffix(base, filepath.Ext(base))
+	// split on both separators so a Windows-style ref ("G:\dir\a.mp4") yields
+	// the same base on a unix host
+	if i := strings.LastIndexAny(ref, `/\`); i >= 0 {
+		ref = ref[i+1:]
+	}
+	base := strings.TrimSuffix(ref, filepath.Ext(ref))
 	if base == "" || base == "." || base == string(filepath.Separator) {
 		base = string(in.TaskID)
 	}

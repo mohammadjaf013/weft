@@ -31,6 +31,12 @@ func fillPlatform(s *Snapshot, path string) error {
 	if err != nil {
 		return err
 	}
+	// The configured storage base path may not exist yet (no jobs run, first
+	// boot); statfs on a nonexistent dir errors. Fall back to CWD for the disk
+	// figures rather than failing the whole /system call.
+	if fi, statErr := os.Stat(abs); statErr != nil || !fi.IsDir() {
+		abs = "."
+	}
 	var st unix.Statfs_t
 	if err := unix.Statfs(abs, &st); err != nil {
 		return err
