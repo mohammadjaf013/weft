@@ -246,25 +246,29 @@ GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "-s -w" -o dist/weft-lin
 
 ## Vision
 
-Weft is becoming an orchestration layer specifically designed for video and audio workloads — a Kubernetes-like platform for multimedia infrastructure. The goal is to make multimedia infrastructure as programmable, scalable, and reliable as modern cloud infrastructure: an infrastructure layer where companies can run video, audio, streaming, and AI media workloads without having to build their own orchestration platform from scratch.
+Weft is a **self-hosted media processing agent** evolving from an early open-source project into a production-grade orchestration platform for multimedia workloads. Our long-term vision is simple: **make multimedia infrastructure as programmable, scalable, and reliable as modern cloud infrastructure.**
+
+We want Weft to become the infrastructure layer where companies can run video, audio, streaming, and AI media workloads without having to build their own orchestration platform from scratch.
 
 ---
 
 ## Roadmap
 
-Weft already supports core media-processing workflows, including distributed FFmpeg processing, HLS generation, subtitles, thumbnails, encryption, and AI-powered subtitle processing. The roadmap is focused on expanding these capabilities while building the infrastructure underneath them:
+Weft already supports core media-processing workflows, including distributed FFmpeg processing, HLS generation, subtitles, thumbnails, encryption, and AI-powered subtitle processing. Our next roadmap is focused on expanding these capabilities while building the infrastructure underneath them:
 
 - **Distributed Media Orchestration** — reliable scheduling and execution of multimedia workloads across multiple servers.
 - **Resource-Aware Scheduling** — intelligent scheduling based on CPU, RAM, disk, GPU, concurrency, and worker availability.
 - **Advanced Job Management** — priorities, retries, pause/resume, crash recovery, dependencies, persistent state, and automatic workload redistribution.
 - **AI Subtitle & Localization** — expanding the existing AI subtitle capabilities into automatic transcription, translation, subtitle synchronization, quality improvement, and multi-language localization workflows.
-- **AI Media Processing** — AI-powered workflows for speech detection, audio enhancement, scene analysis, metadata generation, content understanding, and automated media enrichment.
+- **AI Media Processing** — adding AI-powered workflows for tasks such as speech detection, audio enhancement, scene analysis, metadata generation, content understanding, and automated media enrichment.
 - **Advanced Video Processing** — encoding pipelines, HLS/DASH packaging, multiple quality profiles, thumbnails, previews, audio processing, encryption, and automated media optimization.
-- **GPU Workloads** — GPU-aware scheduling and AI/video workloads that require dedicated GPU resources.
-- **Media Workflow Pipelines** — complex processing workflows defined as reusable pipelines with dependencies between jobs.
+- **GPU Workloads** — support for GPU-aware scheduling and AI/video workloads that require dedicated GPU resources.
+- **Media Workflow Pipelines** — allowing complex processing workflows to be defined as reusable pipelines with dependencies between jobs.
 - **Observability & Operations** — real-time monitoring, metrics, logs, worker health, resource usage, job progress, and failure analysis.
 - **Storage & Cloud Integrations** — flexible integration with S3-compatible storage, local storage, object storage, and different deployment environments.
-- **Kubernetes-like Multimedia Orchestration** — an orchestration layer that brings the concepts of scheduling, workers, resources, scaling, and recovery to multimedia infrastructure.
+- **Kubernetes-like Multimedia Orchestration** — our long-term goal is to build an orchestration layer specifically designed for video and audio workloads, bringing the concepts of scheduling, workers, resources, scaling, and recovery to multimedia infrastructure.
+
+Development of the roadmap is funded through subscriptions, which help fund development infrastructure, multi-server and GPU testing environments, AI processing costs, real-world workload testing, documentation, and developer tooling.
 
 ---
 
