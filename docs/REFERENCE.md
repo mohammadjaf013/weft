@@ -538,10 +538,12 @@ low → background`.
 Task states: `pending → ready → leased → running → done` (or `failed`).
 
 Resource-aware scheduling (`scheduler.max_cpu_percent` / `max_load_average`):
-when either threshold is set, every worker consults the host snapshot before
-picking up a new task. If the machine is already over the ceiling, the worker
-idles and the task stays queued — the pipeline never piles more encodes onto a
-saturated host. Thresholds of 0 (the default) disable the gate.
+when either threshold is set, every worker consults weft's **own** CPU usage
+(the process plus the ffmpeg/whisper children it spawns — never the whole shared
+host) before picking up a new task. If weft is already over the ceiling, the
+worker idles and the task stays queued. `max_load_average` is an optional host
+load-average ceiling (opt-in; it is off by default). Thresholds of 0 disable
+the respective check.
 
 Pause/Resume are **real**, not cosmetic: pausing a running job stops the actual
 `ffmpeg` process (SIGSTOP on Linux; on platforms without POSIX signals the job
