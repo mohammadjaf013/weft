@@ -5,8 +5,6 @@ package sysinfo
 import (
 	"os"
 	"strconv"
-
-	"golang.org/x/sys/unix"
 )
 
 // init registers the Linux self-CPU sampler. It sums the CPU time of this
@@ -31,7 +29,7 @@ func linuxSelfCPU() (float64, error) {
 		if !ok {
 			return
 		}
-		total += (utime + stime) / clkTck()
+		total += (float64(utime) + float64(stime)) / clkTck()
 	}
 	addProc(myPID)
 	// scan /proc for direct children (ppid == our pid)
@@ -55,10 +53,14 @@ func linuxSelfCPU() (float64, error) {
 	return total, nil
 }
 
-// clkTck returns the number of clock ticks per second (usually 100 on Linux).
+// clkTck returns the number of clock ticks per second. Linux USER_HZ is 100 on
+// virtually all architectures (the kernel exports SC_CLK_TCK=100 for userland);
+// fall back to 100 if the value is somehow invalid.
 func clkTck() float64 {
-	if v, err := unix.Sysconf(unix.SC_CLK_TCK); err == nil && v > 0 {
-		return float64(v)
+	if v, err := os.ReadFile("/proc/sys/kernel/clock_tick_rate"); err == nil {
+		if n, err := strconv.Atoi(string(v)); err == nil && n > 0 {
+			return float64(n)
+		}
 	}
 	return 100
 }
