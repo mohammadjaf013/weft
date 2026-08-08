@@ -28,6 +28,29 @@ chaos/     Failure injection: plugin panic, lease expiry, webhook retry.
 cmd/weft/  main.
 ```
 
+
+## Master specification
+
+The Codex-facing project specification lives at the repository root:
+
+- `AGENTS.md` — agent instructions, boundaries, and definition of done.
+- `ARCHITECTURE.md` — current and target architecture.
+- `REQUIREMENTS.md` — functional, non-functional, and distributed requirements.
+- `JOB_LIFECYCLE.md` — target state machine, transition authority, and invariants.
+- `SCHEDULER.md` — DAG, priority, eligibility, and worker scoring rules.
+- `RESOURCE_MANAGER.md` — worker heartbeat payloads, health states, and metrics.
+- `WORKER.md` — worker execution, local state, FFmpeg process management, and shutdown.
+- `RECOVERY.md` — worker failure, master restart, DB outage, retry, and artifact recovery.
+- `DATABASE.md` — persistence entities, transaction rules, migrations, and outage target.
+- `API.md` — target REST API contract.
+- `CLI.md` — current CLI compatibility and target distributed commands.
+- `SECURITY.md` — credentials, path safety, API keys, webhooks, and worker security.
+- `CONFIGURATION.md` — configuration areas and path rules.
+- `TESTING.md` — required checks and failure cases.
+- `DEPLOYMENT.md` — single-daemon and target distributed deployment guidance.
+- `DEVELOPMENT.md` — development workflow and code organization.
+- `ROADMAP.md` — phased path from the current daemon to distributed orchestration.
+
 ## Build & test
 
 ```
