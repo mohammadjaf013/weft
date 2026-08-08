@@ -3,6 +3,7 @@
 *.exe~
 *.zip
 /dist/
+/weft-linux-amd64
 
 # runtime output
 /work/
