@@ -1,0 +1,256 @@
+<div align="center">
+
+# Weft
+
+**A self-hosted media processing agent.** Feed it a video once — get the fully packaged output: H.264/HEVC HLS ladder, thumbnails, subtitles (incl. AI), master playlist, and upload to any storage.
+
+**Durable · Crash-safe · Single static binary · No CGO · Event-sourced**
+
+```
+Weft — media processing agent
+```
+
+</div>
+
+---
+
+## Why Weft?
+
+Media pipelines are fragile. Weft is designed as a **durable agent**: every state change and event is committed to a SQLite store **in one transaction**, so a crash mid-encode is recovered — not lost. It is not a wrapper around a script; it is a small distributed system you run on one box.
+
+| Problem | Weft's answer |
+|---|---|
+| A long encode dies at 80% | Job is re-queued automatically when the worker lease expires; resume, don't restart |
+| No visibility into what's happening | REST API + CLI + Prometheus metrics + HMAC-signed webhooks on every event |
+| "It works on my machine" | `weft doctor` checks ffmpeg/ffprobe/config before you run anything |
+| Post-production edits break a published video | `subtitle-add`, `dub-add` and `rebuild-master` update an existing HLS package in place |
+| Subtitles in another language | `ai-subtitle` transcribes with **whisper.cpp** and translates/refines with **Gemini** (`hybrid`) |
+
+---
+
+## Features
+
+- **DAG job pipelines** — profiles define task graphs (`vod-h264`, `audio`, `thumbnail`, `subtitle-add`, `dub-add`, `ai-subtitle`); tasks run when all dependencies complete.
+- **Durable event sourcing** — SQLite (WAL) store; every transition and event commits atomically.
+- **Crash recovery** — workers lease tasks; expired leases are re-queued. No loss, no double-publish.
+- **Priority queues** — `emergency → high → normal → low → background`.
+- **AI subtitles** — whisper.cpp (offline) and/or Gemini; `--provider whisper|gemini|hybrid`, `--src-lang` + `--lang` for transcription-then-translation.
+- **Live progress** — whisper `-pp` and ffmpeg `-progress pipe:1` drive real progress events, surfaced via API and webhooks.
+- **Webhooks** — at-least-once delivery, `X-Weft-Signature: HMAC-SHA256`, exponential backoff, dead-letter replay.
+- **Multi-storage** — local, SSH/SFTP, and S3 (hand-rolled SigV4, no SDK).
+- **Master playlist recovery** — `POST /storage/rebuild-master` regenerates `playlist.m3u8` from whatever is actually on disk (recovers corrupted/old-binary masters).
+- **Security** — argon2id API keys with scopes; TLS supported.
+- **Static binary** — pure Go, `modernc.org/sqlite` (no CGO), cross-compiled for linux/amd64 + linux/arm64.
+
+---
+
+## Quick start
+
+```bash
+# 1. Build (or download a release binary)
+go build -o weft ./cmd/weft
+
+# 2. Create a default config
+./weft init-config
+
+# 3. Check the environment
+./weft doctor
+
+# 4. Run the daemon
+./weft serve --config weft.yaml
+```
+
+In another shell:
+
+```bash
+# Encode a video into HLS (360p..1080p) + thumbnails + subtitles + upload
+weft jobs create /data/movie.mp4 --profile vod-h264
+
+# Watch it
+weft jobs get <job_id>
+weft jobs list --status running
+
+# AI subtitles: transcribe English audio, translate to Persian
+weft jobs create /data/movie.mp4 --profile ai-subtitle --provider hybrid --src-lang en --lang fa
+```
+
+---
+
+## Architecture
+
+```
+┌─────────────┐     ┌──────────────────────────────────────────────┐
+│  weft CLI   │────▶│  REST API (chi) · API keys · scopes          │
+└─────────────┘     │  /jobs /queue /workers /webhooks /storage    │
+                    └──────────────┬───────────────────────────────┘
+                                   │ events (bus)
+                    ┌──────────────▼───────────────────────────────┐
+                    │  Scheduler (DAG + priority + lease expiry)   │
+                    │  State Machine (legal transitions only)      │
+                    └──────────────┬───────────────────────────────┘
+                                   │ runnable tasks
+                    ┌──────────────▼───────────────────────────────┐
+                    │  Worker pool  ·  plugin registry (sandbox)   │
+                    │  ffmpeg executor (-progress pipe:1)          │
+                    └──────────────┬───────────────────────────────┘
+                                   │ assets
+                    ┌──────────────▼───────────────────────────────┐
+                    │  Storage: local / SSH / S3  ·  upload plugin │
+                    └──────────────────────────────────────────────┘
+
+  Durable core:  SQLite (WAL) = store + event log + outbox (one txn)
+```
+
+### Layers
+
+```
+core/      Layer 1 — pure stdlib, zero I/O. Types, scheduler, state machine,
+           event bus, lease store. Never touches disk/network.
+runtime/   Layer 2 — implementations of core interfaces.
+  store/sqlite    WAL SQLite store (durable event sourcing + outbox).
+  executor/ffmpeg ffmpeg/ffprobe with `-progress pipe:1` parsing.
+  registry/       plugin registry with panic sandbox.
+  webhook/        HMAC-signed at-least-once delivery, backoff, dead letter.
+  metrics/        Prometheus text export (hand-rolled, no deps).
+  api/            chi REST API + argon2id API keys + scopes.
+  worker/         worker loop (reserve → execute → mark done).
+daemon/    The single assembly point (config → all components → Serve).
+plugins/   Media + storage plugins (hls, subtitle, ai-subtitle, upload, ...).
+profiles/  Profile → DAG templates (vod-h264, audio, ai-subtitle, ...).
+configs/   weft.yaml schema + startup validation.
+cli/       Thin CLI over the API (serve, doctor, jobs, keys, ...).
+e2e/       Full lifecycle test over the real daemon (fake ffmpeg).
+chaos/     Failure injection: plugin panic, lease expiry, webhook retry.
+```
+
+### Job lifecycle
+
+```
+queued → reserved → running → uploading → completed
+             └──────── (any step fails) ───────▶ failed
+```
+
+- A task becomes runnable the moment all DAG dependencies are done.
+- Every state change + its event commits in **one transaction**.
+- Workers lease tasks; a crashed worker's task is **re-queued** when the lease expires.
+
+---
+
+## Configuration
+
+`weft init-config` writes a full `weft.yaml` with defaults. Everything validates at startup — a broken provider refuses to boot.
+
+```yaml
+network:
+  listen: 127.0.0.1:8443
+security:
+  api_keys: true
+  admin_api_key: "<set this>"
+ai_subtitle:
+  provider: whisper            # whisper | gemini | hybrid
+  whisper:
+    model_path: "/opt/weft/models/ggml-medium.bin"
+    language: "en"             # source language of the audio
+    threads: 8
+    temperature: 0.0           # deterministic output
+    prompt: "Spider-Man, Peter Parker, Zendaya"
+  gemini:
+    api_key: ""                # required for hybrid translation
+    model: "gemini-1.5-flash"
+    language: "fa"             # target language
+```
+
+See [docs/SETUP-FA.md](docs/SETUP-FA.md) for the full configuration reference and deployment guide.
+
+---
+
+## CLI reference
+
+```
+weft serve [--config <path>]           run the agent daemon
+weft init-config [<path>]              write a default weft.yaml
+weft doctor [--config <path>]          check ffmpeg, config, db, connectivity
+weft version                           print version
+
+weft jobs list [--status S] [--priority P] [--limit N]
+weft jobs get <id>
+weft jobs create <input_ref> --profile <name> [--priority P]
+                [--destination N] [--path P] [--name N] [--lang L]
+                [--src-lang S] [--provider whisper|gemini|hybrid]
+weft jobs events <id>
+weft jobs action <id> <cancel|retry|pause|resume>
+
+weft keys create <name> <scope...> | keys list | keys delete <id>
+weft webhooks create <url> <event...> [--secret S] | list | delete <id>
+weft storage list | add <id> <type> [--host H] [--user U]
+weft queue | workers | profiles | plugins | metrics | benchmark | system
+```
+
+All remote commands accept `--api <url>` and `--key <token>`.
+
+---
+
+## REST API
+
+| Method | Path | Scope |
+|---|---|---|
+| GET | `/health` | — |
+| GET/POST | `/jobs` | `jobs:read` / `jobs:write` |
+| GET | `/jobs/{id}`, `/jobs/{id}/events` | `jobs:read` |
+| POST | `/jobs/{id}/{action}` (cancel/retry/pause/resume) | `jobs:write` |
+| GET | `/queue`, `/workers` | `queue:read`, `workers:read` |
+| GET/POST | `/storage/servers` | `storage:manage` |
+| POST | `/storage/rebuild-master` | `storage:manage` |
+| GET/POST/DELETE | `/webhooks` (+ `/webhooks/{id}/replay`) | `webhooks:manage` |
+| GET/POST/DELETE | `/keys` | `keys:manage` |
+| GET | `/profiles`, `/plugins` | `profiles:read`, `plugins:read` |
+| POST/GET | `/benchmark`, `/metrics`, `/system` | `metrics:read` |
+
+Error responses are structured: `{"error": {"code": "...", "message": "..."}}`.
+
+---
+
+## Webhooks
+
+Every domain event is fanned out to the outbox and delivered **at-least-once**:
+
+```
+X-Weft-Event: job.completed
+X-Weft-Signature: HMAC-SHA256(secret, body)
+```
+
+Wire events include `job.created`, `job.started`, `job.progress`, `task.progress`, `job.completed`, `job.failed` and more. Failed deliveries retry with exponential backoff and land in a replayable dead-letter log.
+
+---
+
+## Development
+
+```bash
+go build ./...      # build everything
+go vet ./...        # static checks
+go test ./...       # unit + integration + chaos (integration skips without ffmpeg)
+```
+
+Cross-compile for Linux:
+
+```bash
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w" -o dist/weft-linux-amd64 ./cmd/weft
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "-s -w" -o dist/weft-linux-arm64 ./cmd/weft
+```
+
+> No CGO: SQLite is `modernc.org/sqlite` (pure Go), S3 is hand-rolled SigV4 — the daemon is one static binary.
+
+---
+
+## Documentation
+
+- [docs/README.md](docs/README.md) — architecture overview
+- [docs/SETUP-FA.md](docs/SETUP-FA.md) — setup, configuration, deployment (فارسی)
+- [docs/GUIDE-FA.md](docs/GUIDE-FA.md) — user guide (فارسی)
+- [docs/CLI-API-FA.md](docs/CLI-API-FA.md) — CLI + API reference (فارسی)
+
+---
+
+## License
+
+[MIT](LICENSE) © Mohammad Jaf
