@@ -96,7 +96,7 @@ func startDaemon(t *testing.T, register func(*registry.Registry, *cfg.Config) er
 	d, err := daemon.Open(c, nil, daemon.Options{
 		Executor:       ffexec.NewFake(core.Result{ExitCode: 0}, nil),
 		PluginRegister: register,
-		InputResolver: func(job core.Job) (string, error) {
+		InputResolver: func(ctx context.Context, job core.Job) (string, error) {
 			return filepath.Join(mediautil.WorkRoot, string(job.ID)+".in"), nil
 		},
 	})

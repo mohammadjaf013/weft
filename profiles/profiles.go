@@ -112,6 +112,30 @@ var Profiles = map[string]Profile{
 			"update_master": {"track": "audio"},
 		},
 	},
+	// trim-update re-packages an already-published video with a new trim
+	// window: input is the ORIGINAL source (a local path, or a relative path
+	// via --source-server against a registered storage server — see
+	// daemon.resolveInput), --trim-start/--trim-end select the new window,
+	// --name matches the existing published base name so the re-encoded
+	// renditions land on the same files and replace them in place. Reuses
+	// the hls plugin's existing trim handling — no separate trim engine.
+	"trim-update": {
+		Name:        "trim-update",
+		Description: "Re-trim an already-published video in place: input is the original source, --trim-start/--trim-end select the new window, --name matches the existing published base name",
+		TaskKinds:   []string{"hls", "upload"},
+		Edges: []Edge{
+			{From: "hls", To: "upload"},
+		},
+	},
+	// poster-replace uploads a caller-supplied image straight to an
+	// already-published video's poster path, no ffmpeg involved: input is
+	// the image file itself (local, or --source-server), --name matches the
+	// existing published base name.
+	"poster-replace": {
+		Name:        "poster-replace",
+		Description: "Replace an already-published video's poster image: input is the image file, --name matches the existing published base name",
+		TaskKinds:   []string{"poster_upload"},
+	},
 	"ai-subtitle": {
 		Name:        "ai-subtitle",
 		Description: "AI subtitle generation (whisper/gemini) + upload",

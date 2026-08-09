@@ -56,10 +56,16 @@ scheduler:
   mode: "dynamic"              # concurrency mode
   max_cpu_percent: 85          # don't schedule new work above this CPU
   max_load_average: 0          # optional load-average ceiling
+  max_estimated_cpu_cores: 0   # 0 = unlimited; caps the SUM of in-flight
+                                # tasks' DECLARED plugin cost (not measured
+                                # usage — complements max_cpu_percent, which
+                                # reacts to actual saturation)
+  max_estimated_ram_mb: 0      # same idea, for declared RAM cost
 
 workers:
   min: 1                       # always at least this many workers
-  max: 0                       # 0 = auto (derived from cores/load)
+  max: 0                       # 0 = auto: one worker per logical CPU core
+                                # (bounded below by min)
   lease_ttl_seconds: 300       # crash recovery: task re-queued after this
 
 queue:
@@ -78,6 +84,7 @@ plugins:
     - master_playlist
     - master_update
     - upload
+    - poster_upload
     - storage-local
     - storage-ssh
     - storage-s3
@@ -161,15 +168,23 @@ weft version                           print version (also -v / --version)
 
 weft jobs list [--status S] [--priority P] [--limit N]
 weft jobs get <id>
-weft jobs create <input_ref> --profile <name>
+weft jobs create <input_ref> --profile <name> [flags — see below]
 weft jobs events <id>
+weft jobs log <job_id> <task_id>
+weft jobs asset <job_id> <asset_name>
 weft jobs action <id> <cancel|retry|pause|resume>
+weft jobs priority <id> <emergency|high|normal|low|background>
+weft jobs delete <id> [?purge_files=false via the API — CLI always purges]
 
 weft keys create <name> <scope...> | keys list | keys delete <id>
-weft webhooks create <url> <event...> [--secret S] | list | delete <id>
+weft webhooks create <url> <event...> [--secret S] | list | delete <id> | replay <event_id>
 weft storage list | add <id> <type> [...] | rebuild --path <dir>
 
-weft queue | workers | profiles | plugins | metrics | benchmark | system
+weft queue | workers [scale <n>] | profiles | plugins | metrics | system
+weft benchmark [run] | benchmark get
+weft config export [--out F] [--include-secrets] | config import <file>
+weft cron list | cron run <cleanup|benchmark|health_scan>
+weft dashboard [--interval 2s]
 ```
 
 Global flags (may appear before or after the subcommand): `--api <url>`,
@@ -179,15 +194,23 @@ Global flags (may appear before or after the subcommand): `--api <url>`,
 
 | Flag | Meaning |
 |---|---|
-| `--profile <name>` | Required. Profile/DAG template. |
+| `--profile <name>` | Required. Profile/DAG template — see [§7 Profiles](#7-profiles). |
 | `--priority <p>` | `emergency` \| `high` \| `normal` \| `low` \| `background` (default `normal`) |
-| `--destination <n>` | Storage server id; `0` = local (default). |
+| `--destination <n>` | Destination storage server id; `0` = local (default). |
+| `--source-server <n>` | When set, `input_ref` is a relative path resolved against this REGISTERED storage server (same servers `weft storage add` registers) instead of a local filesystem path — lets trim/thumbnail/subtitle operate on a source that lives on ssh/s3, not just local disk. `input_ref` can also be a plain `http://`/`https://` URL without this flag; it's fetched directly. |
 | `--lang <L>` | Subtitle target language (e.g. `fa`, `en`). |
 | `--src-lang <L>` | Language the audio is spoken in (whisper `-l`). Differs from `--lang` → hybrid translates. |
 | `--provider <p>` | Per-job ai-subtitle provider: `whisper` \| `gemini` \| `hybrid` (empty = server default). |
-| `--name <n>` | Base name for output assets (re-running replaces the same track). |
+| `--name <n>` | Base name for output assets (re-running replaces the same track; also used by `trim-update`/`poster-replace` to target the existing published files). |
 | `--path <p>` | Subdirectory under the destination root (e.g. `movie`, `series`). |
 | `--delete-source` | Delete the source file after a successful upload. |
+| `--trim-start <s>` | Skip this many seconds from the start of the clip before HLS packaging. |
+| `--trim-end <s>` | Cut this many seconds off the end of the clip. Either or both of trim-start/trim-end may be set. Also used by the `trim-update` profile to re-trim an already-published video in place. |
+| `--thumb-count <n>` | Produce exactly N evenly-spaced thumbnails instead of the default poster/sprite/stills set. |
+| `--thumb-at <s>` | Capture a single frame at this offset (seconds) instead of the default set or `--thumb-count`'s N-evenly-spaced mode — mutually exclusive with `--thumb-count`. |
+| `--thumb-size <WxH\|original>` | Custom thumbnail dimensions; applies to `--thumb-count` or `--thumb-at`. |
+| `--forced` | Mark this subtitle track `FORCED=YES` (`--profile subtitle-add`; ignored otherwise). |
+| `--default` | Mark this subtitle track `DEFAULT=YES` (`--profile subtitle-add`; ignored otherwise). |
 
 ### `storage add` options
 
@@ -234,9 +257,14 @@ has the shape `{"error":{"code":"...","message":"..."}}`.
 | POST | `/jobs` | `jobs:write` |
 | GET | `/jobs/{id}` | `jobs:read` |
 | GET | `/jobs/{id}/events` | `jobs:read` |
+| GET | `/jobs/{id}/tasks/{taskID}/log` | `jobs:read` |
+| GET | `/jobs/{id}/assets/{name}` | `jobs:read` |
+| DELETE | `/jobs/{id}` | `jobs:write` |
+| PATCH | `/jobs/{id}/priority` | `jobs:write` |
 | POST | `/jobs/{id}/{action}` | `jobs:write` |
 | GET | `/queue` | `queue:read` |
 | GET | `/workers` | `workers:read` |
+| POST | `/workers/scale` | `workers:write` |
 | GET | `/storage/servers` | `storage:manage` |
 | POST | `/storage/servers` | `storage:manage` |
 | POST | `/storage/rebuild-master` | `storage:manage` |
@@ -253,12 +281,16 @@ has the shape `{"error":{"code":"...","message":"..."}}`.
 | GET | `/benchmark` | `metrics:read` |
 | GET | `/metrics` | `metrics:read` |
 | GET | `/system` | `metrics:read` |
+| GET | `/config/export` | `config:manage` |
+| POST | `/config/import` | `config:manage` |
+| GET | `/cron` | `cron:manage` |
+| POST | `/cron/{job}/run` | `cron:manage` |
 
 ### Scopes
 
-`jobs:read` · `jobs:write` · `queue:read` · `workers:read` · `storage:manage` ·
-`webhooks:manage` · `keys:manage` · `profiles:read` · `plugins:read` ·
-`metrics:read`
+`jobs:read` · `jobs:write` · `queue:read` · `workers:read` · `workers:write` ·
+`storage:manage` · `webhooks:manage` · `keys:manage` · `profiles:read` ·
+`plugins:read` · `metrics:read` · `config:manage` · `cron:manage`
 
 ### `POST /jobs` — create a job
 
@@ -267,15 +299,31 @@ has the shape `{"error":{"code":"...","message":"..."}}`.
   "input_ref": "/srv/weft/film.mp4",
   "profile": "vod-h264",
   "destination_id": 0,
+  "source_server_id": 0,
   "priority": "normal",
   "lang": "fa",
   "src_lang": "en",
   "name": "movie",
   "path": "Series-Test/movie1",
   "provider": "hybrid",
-  "delete_source": false
+  "delete_source": false,
+  "trim_start": 0,
+  "trim_end": 0,
+  "thumb_count": 0,
+  "thumb_at": 0,
+  "thumb_size": "",
+  "forced": false,
+  "default": false
 }
 ```
+
+`input_ref` can be a local path, an `http://`/`https://` URL (fetched
+directly), or — when `source_server_id` is set — a relative path resolved
+against that registered storage server (local/ssh/s3, same servers `POST
+/storage/servers` registers). This is what lets trim/thumbnail/subtitle
+profiles run against a source that lives on remote storage, not just local
+disk; the fetched file is cached under a per-job scratch dir and cleaned up
+once the job finishes.
 
 Response `201 Created`:
 
@@ -284,7 +332,8 @@ Response `201 Created`:
 ```
 
 Validation errors (`400`): `invalid_request` (malformed / missing fields),
-`unknown_profile`, `invalid_priority`, `unknown_destination`, `invalid_provider`.
+`unknown_profile`, `invalid_priority`, `unknown_destination`,
+`unknown_source_server`, `invalid_provider`.
 
 ### `GET /jobs/{id}` — job detail
 
@@ -296,21 +345,76 @@ Validation errors (`400`): `invalid_request` (malformed / missing fields),
   "profile": "vod-h264",
   "input_ref": "/srv/weft/film.mp4",
   "destination_id": 0,
+  "source_server_id": 0,
   "verified": false,
   "overall_progress": 42.5,
   "error": "",
   "tasks": [
     { "id": "task_...", "kind": "hls", "status": "running",
-      "progress_percent": 61.2, "depends_on": [], "error": "" }
-  ]
+      "progress_percent": 61.2, "depends_on": [], "error": "",
+      "started_at": "2026-01-01T12:00:00Z" }
+  ],
+  "assets": [ { "kind": "thumbnail", "name": "movie_poster.jpg", "uri": "local:thumbnails/movie_poster.jpg", "dir": "thumbnails", "bytes": 20481 } ]
 }
 ```
+
+`started_at` (per task) lets a client compute a naive linear ETA
+(`elapsed/(progress/100) - elapsed`) without a dedicated endpoint — this is
+exactly what `weft dashboard` does for the currently-selected job.
+
+`GET /jobs?include_progress=true` additionally computes `overall_progress`
+per row in the list response (opt-in: computing it costs one extra query per
+returned job, so it's off by default for a plain `weft jobs list`).
+
+### `GET /jobs/{id}/tasks/{taskID}/log`
+
+Returns the captured stderr tail (ffmpeg/whisper) of one task:
+`{ "task_id": "...", "log": "..." }`. Empty `log` means nothing was captured
+(task hasn't run yet, or produced no output).
+
+### `GET /jobs/{id}/assets/{name}`
+
+Returns one produced asset as a base64 data URI — grab a thumbnail or other
+small output directly from the API without touching storage:
+`{ "name": "...", "uri": "...", "mime": "image/jpeg", "data": "<base64>" }`.
+Capped at **10 MB**; an oversized asset returns `413 asset_too_large` — fetch
+large files (full `.ts`/`.mp4` segments) from storage directly instead.
+
+### `DELETE /jobs/{id}`
+
+Removes a job and all its data (tasks, events, outputs, logs) — refused
+(`409 job_active`) while the job is still queued/reserved/running/uploading/
+paused/resumed; cancel it first. By default also deletes the job's published
+files from destination storage (best-effort — a delete failure on one asset
+is logged, not fatal, and never blocks clearing the DB record); pass
+`?purge_files=false` to keep the files (e.g. a shared/symlinked destination
+path).
+
+### `PATCH /jobs/{id}/priority`
+
+```json
+{ "priority": "emergency" }
+```
+
+Changes a job's priority while it's still `queued` or `reserved` — once a
+task has actually started running, reordering the queue can no longer affect
+it, so this returns `409 job_not_queued` past that point rather than
+silently no-op-ing. `400 invalid_priority` for an unknown value.
 
 ### `POST /jobs/{id}/{action}`
 
 Actions: `cancel` → `cancelled` · `retry` → `retry` · `pause` → `paused` ·
 `resume` → `resumed`. Returns `409 invalid_transition` for illegal transitions
 (enforced by the state machine).
+
+### `POST /workers/scale`
+
+```json
+{ "count": 8 }
+```
+
+Resizes the running worker pool at runtime, capped by `workers.max` when set
+(`> 0`). No daemon restart needed.
 
 ### `POST /storage/rebuild-master`
 
@@ -359,6 +463,44 @@ Host snapshot: `num_cpu`, `load1/5/15`, `cpu_percent`, `mem_total/used/avail`,
 
 Prometheus text format (`text/plain; version=0.0.4`).
 
+### `GET /config/export` / `POST /config/import`
+
+`GET /config/export` returns the running config as YAML — the same shape
+`weft.yaml` is authored in, so it round-trips straight back into `config
+import` or `--config`. Secrets (`security.admin_api_key`, webhook secrets,
+`ai_subtitle.gemini.api_key`) are redacted (`<redacted>`) by default; add
+`?include_secrets=true` to get the real values (same auth/scope either way —
+this is about accidental leakage in logs/screenshots, not access control).
+
+`POST /config/import` validates a full config body (rejecting a
+`<redacted>` placeholder rather than silently writing it over a real secret)
+and writes it to the file the daemon was started with (`weft serve
+--config <path>`). **It does not hot-reload** — most config (listen address,
+worker pool, plugins, storage) is only read at startup, so the response
+includes `"applied": false` and a note that `weft serve` needs a restart to
+pick it up. Returns `501 not_configured` if the daemon wasn't started with an
+explicit `--config` path.
+
+### `GET /cron` / `POST /cron/{job}/run`
+
+`GET /cron` lists the three built-in jobs (`cleanup`, `benchmark`,
+`health_scan`) — schedule, last run, next run, last error if any.
+`POST /cron/{job}/run` triggers one immediately, sharing the exact same
+run+bookkeeping path the scheduler's own ticker uses. `404
+cron_job_not_found` for an unknown name; a known job that runs but fails
+still returns `200` with `{"status":"failed","error":"..."}` (the *trigger*
+succeeded, the job itself didn't) — 404 is reserved for routing, not job
+outcomes.
+
+`cleanup` prunes terminal-status jobs past `cron.cleanup.retention_hours` and
+events past `cron.cleanup.event_retention_days` (in addition to the
+always-on hourly interval pruners — the cron entry is what makes this
+inspectable/triggerable by hand, not a second independent mechanism).
+`benchmark` re-runs the node benchmark. `health_scan` samples host resources
+and publishes a `node.health` webhook event — raw data collection; a
+composite Health Score on top of these samples is a future refinement, not
+built yet.
+
 ---
 
 ## 5. Webhooks
@@ -393,6 +535,7 @@ webhook that keeps failing puts events in a dead-letter log, replayable with
 | `pipeline.started` / `pipeline.finished` | Whole pipeline bounds |
 | `plugin.started` / `plugin.finished` | A single plugin ran |
 | `node.joined` / `node.left` | Daemon membership (single-node: startup/shutdown) |
+| `node.health` | Published by the `health_scan` cron job — a host resource snapshot (raw data; no composite Health Score yet) |
 
 ### Webhook payload
 
@@ -499,11 +642,21 @@ lists them live.
 | `subtitle-add` | SRT/VTT/ASS | add/replace a subtitle track on an already-published video + master update + upload |
 | `dub-add` | audio file | add/replace a dubbed audio track + master update + upload |
 | `ai-subtitle` | media | AI subtitles (whisper/gemini/hybrid) + upload |
+| `trim-update` | video (original source) | re-trim an already-published video in place: hls + upload, `--trim-start`/`--trim-end` select the new window, `--name` matches the existing published base name |
+| `poster-replace` | image (jpg/png/webp) | replace an already-published video's poster image, no ffmpeg involved — the image IS the input, copied straight to the destination |
 
-`subtitle-add` / `dub-add` take `--lang` (track language) and `--name` (base
-name). Re-running with the same `--lang` **replaces** the track; a new `--lang`
-adds a second track. The master playlist is rewritten in place to reference the
-new track.
+`subtitle-add` / `dub-add` take `--lang` (track language), `--name` (base
+name), and (subtitle-add only) `--forced`/`--default` to set the
+`#EXT-X-MEDIA` flags. Re-running with the same `--lang` **replaces** the
+track; a new `--lang` adds a second track. The master playlist is rewritten
+in place to reference the new track.
+
+`trim-update` and `poster-replace` are **post-hoc** profiles: their "input"
+is the original source file (or, for poster-replace, a new image), not the
+already-published HLS output — set `--source-server` if that source lives on
+a registered remote storage server rather than local disk. Both reuse the
+existing trim/upload plugin logic; there's no separate "edit the published
+output" engine.
 
 ### Output layout
 
@@ -529,21 +682,45 @@ Job states:
 
 ```
 queued → reserved → running → uploading → completed
+                       ↕ paused/resumed
              └──── (any step fails) ──→ failed / retry / dead_letter
 ```
 
-Priority bands (scheduled strictly in this order): `emergency → high → normal →
-low → background`.
+A paused job resumes into `resumed`, which behaves exactly like `running` for
+every subsequent transition (uploading, completed, failed, cancelled,
+retry, paused again) — it's not a dead end.
+
+Priority bands (scheduled strictly in this order, and re-evaluated fresh on
+every scheduling poll — `PATCH /jobs/{id}/priority` takes effect immediately,
+no restart needed): `emergency → high → normal → low → background`. Within
+the same band, tasks are served oldest-job-first.
 
 Task states: `pending → ready → leased → running → done` (or `failed`).
 
-Resource-aware scheduling (`scheduler.max_cpu_percent` / `max_load_average`):
-when either threshold is set, every worker consults weft's **own** CPU usage
-(the process plus the ffmpeg/whisper children it spawns — never the whole shared
-host) before picking up a new task. If weft is already over the ceiling, the
-worker idles and the task stays queued. `max_load_average` is an optional host
-load-average ceiling (opt-in; it is off by default). Thresholds of 0 disable
-the respective check.
+**Worker pool sizing**: `workers.max: 0` ("auto") starts one worker per
+logical CPU core (bounded below by `workers.min`); `workers.max: N` caps it
+explicitly. `POST /workers/scale` (`weft workers scale <n>`) resizes the
+pool at runtime.
+
+**Resource-aware scheduling** uses two complementary mechanisms:
+
+- **Gate** (`scheduler.max_cpu_percent` / `max_load_average`, measured):
+  every worker consults weft's **own** CPU usage (the process plus the
+  ffmpeg/whisper children it spawns — never the whole shared host) before
+  picking up a new task. If weft is already over the ceiling, the worker
+  idles and the task stays queued. `max_load_average` is an optional host
+  load-average ceiling (opt-in; off by default). Thresholds of 0 disable the
+  respective check.
+- **Budget** (`scheduler.max_estimated_cpu_cores` / `max_estimated_ram_mb`,
+  declared): sums each in-flight task's plugin-declared cost
+  (`EstimatedCPU`/`EstimatedRAMMB`) and refuses a new claim that would push
+  the total over the ceiling. This prevents over-committing *before*
+  saturation is even measurable — e.g. not starting 8 HLS encodes at once on
+  an 8-core box just because Gate's CPU sampling hasn't caught up yet. A
+  single task costlier than the whole budget is still admitted when nothing
+  else is reserved, so an undersized budget can't starve every task forever
+  — it only ever blocks a *second* concurrent one. Both are 0 (unlimited) by
+  default.
 
 Pause/Resume are **real**, not cosmetic: pausing a running job stops the actual
 `ffmpeg` process (SIGSTOP on Linux; on platforms without POSIX signals the job
@@ -552,13 +729,19 @@ state still flips but the child keeps running), and resuming continues it
 
 Durability model:
 
-- Every state transition **and** its event commit in **one** SQLite
-  (WAL) transaction — no split-brain between state and log.
+- Every state transition, its event, **and** any matching webhook outbox
+  row commit together in **one** SQLite (WAL) transaction — a crash between
+  "state changed" and "webhook enqueued" cannot happen, because they're not
+  two steps.
 - Workers **lease** tasks (`workers.lease_ttl_seconds`). A crashed worker's
   lease expires and the task is **re-queued** — work resumes, never duplicates
   or loses a publish.
 - The state machine rejects illegal transitions (`409 invalid_transition`).
 - A task exceeding `workflow.default_timeout_seconds` times out.
+- Terminal-status jobs and old events are pruned automatically
+  (`cron.cleanup.retention_hours` / `event_retention_days`, both also
+  triggerable by hand via `weft cron run cleanup`) so job/event history
+  doesn't grow without bound.
 
 ---
 
@@ -583,14 +766,29 @@ Durability model:
 |---|---|
 | Health check | `weft doctor` (exit 0 = healthy) |
 | Version | `weft version` |
+| Live dashboard | `weft dashboard` |
 | Queue summary | `weft queue` |
-| Worker status | `weft workers` |
+| Worker status | `weft workers` (`weft workers scale <n>` to resize) |
 | Host snapshot | `weft system` |
-| CPU/ffmpeg benchmark | `weft benchmark` |
+| CPU/ffmpeg benchmark | `weft benchmark` (`weft benchmark get` for the last recorded result) |
 | Prometheus metrics | `weft metrics` |
+| Cron jobs | `weft cron list` / `weft cron run <cleanup\|benchmark\|health_scan>` |
+| Config backup/restore | `weft config export -o backup.yaml` / `weft config import backup.yaml` (restart to apply) |
 | Manual backup | copy `weft.db` (SQLite WAL — safe to copy after checkpoint) |
 | Rebuild a broken master | `weft storage rebuild --path Series-Test/movie1` |
 | Systemd | run `weft serve --config /opt/weft/weft.yaml` as a service |
+
+### `weft dashboard`
+
+A live terminal view — jobs (running/queued/paused/resumed/uploading),
+priority queue, workers, and host resources — refreshed on `--interval`
+(default 2s). Arrow keys / `j`/`k` select a job row; `c` cancels, `p` pauses,
+`r` resumes, `x` deletes (asks `y`/N to confirm), `enter` refreshes
+immediately, `q` quits. Selecting a row also shows that job's per-task
+breakdown with a naive ETA (`elapsed/(progress/100) - elapsed`, from the
+task's `started_at`). Every action goes through the same REST calls as the
+one-shot `weft jobs action`/`weft jobs delete` commands — the dashboard is a
+polling+keyboard wrapper around them, not a separate code path.
 
 ### Linux deployment
 
@@ -615,11 +813,13 @@ go test ./... -count=1  # unit + integration + chaos
 ```
 
 - No CGO: SQLite via `modernc.org/sqlite`, S3 SigV4 hand-rolled — one static
-  binary.
+  binary. The CLI dashboard is the one exception with real dependencies
+  (`charmbracelet/bubbletea`, `bubbles`, `lipgloss`) — still pure Go, no CGO.
 - Layers: `core/` (pure stdlib, no I/O) · `runtime/` (store, executor, webhook,
-  metrics, api, worker, registry) · `plugins/` (media + storage) · `profiles/`
-  (DAG templates) · `daemon/` (assembly) · `cli/` (thin client) · `e2e/`,
-  `chaos/`, `integration/` (tests).
+  metrics, api, worker, registry, cron, sysinfo) · `plugins/` (media +
+  storage + poster upload) · `profiles/` (DAG templates) · `daemon/`
+  (assembly) · `cli/` (thin client + the dashboard TUI) · `e2e/`, `chaos/`,
+  `integration/` (tests).
 - Test suites: `e2e` runs the real daemon against a fake executor; `chaos`
   injects plugin panics, lease expiries, and webhook failures; `integration`
   runs real ffmpeg when present (skips otherwise).
@@ -637,16 +837,25 @@ client.
 | `weft jobs list` | `GET /jobs` |
 | `weft jobs get <id>` | `GET /jobs/{id}` |
 | `weft jobs events <id>` | `GET /jobs/{id}/events` |
+| `weft jobs log <id> <task_id>` | `GET /jobs/{id}/tasks/{taskID}/log` |
+| `weft jobs asset <id> <name>` | `GET /jobs/{id}/assets/{name}` |
 | `weft jobs create ...` | `POST /jobs` |
 | `weft jobs action <id> <a>` | `POST /jobs/{id}/{a}` |
+| `weft jobs priority <id> <p>` | `PATCH /jobs/{id}/priority` |
+| `weft jobs delete <id>` | `DELETE /jobs/{id}` |
 | `weft queue` | `GET /queue` |
 | `weft workers` | `GET /workers` |
+| `weft workers scale <n>` | `POST /workers/scale` |
 | `weft storage list` | `GET /storage/servers` |
 | `weft storage add ...` | `POST /storage/servers` |
 | `weft storage rebuild ...` | `POST /storage/rebuild-master` |
 | `weft webhooks list/create/delete` | `GET/POST /webhooks`, `DELETE /webhooks/{id}` |
+| `weft webhooks replay <event_id>` | `POST /webhooks/{event_id}/replay` |
 | `weft keys create/list/delete` | `POST/GET /keys`, `DELETE /keys/{id}` |
 | `weft profiles` | `GET /profiles` |
 | `weft plugins` | `GET /plugins` |
 | `weft metrics` | `GET /metrics` |
-| `weft benchmark` | `POST /benchmark` |
+| `weft benchmark` / `benchmark get` | `POST /benchmark` / `GET /benchmark` |
+| `weft config export/import` | `GET /config/export` / `POST /config/import` |
+| `weft cron list` / `cron run <job>` | `GET /cron` / `POST /cron/{job}/run` |
+| `weft dashboard` | polls `GET /jobs`, `/queue`, `/workers`, `/system`, `/jobs/{id}`; actions via `POST /jobs/{id}/{a}`, `DELETE /jobs/{id}` |

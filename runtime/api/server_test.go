@@ -16,6 +16,7 @@ import (
 	cfg "github.com/mohammadjaf013/weft/configs"
 	"github.com/mohammadjaf013/weft/core"
 	"github.com/mohammadjaf013/weft/plugins/storage/local"
+	"github.com/mohammadjaf013/weft/runtime/cron"
 	"github.com/mohammadjaf013/weft/runtime/metrics"
 	"github.com/mohammadjaf013/weft/runtime/registry"
 	"github.com/mohammadjaf013/weft/runtime/store/sqlite"
@@ -326,6 +327,45 @@ func TestJobActionCancel(t *testing.T) {	srv, _, km := newTestServer(t)
 	}
 }
 
+func TestJobPriorityUpdate(t *testing.T) {
+	srv, _, km := newTestServer(t)
+	raw, _, _ := km.Create("w", []string{"jobs:write", "jobs:read"})
+	rr := doRequest(t, srv, "POST", "/jobs", `{"input_ref":"x","profile":"vod-h264","priority":"low"}`, raw)
+	if rr.Code != 201 {
+		t.Fatalf("create = %d: %s", rr.Code, rr.Body.String())
+	}
+	var created map[string]any
+	json.Unmarshal(rr.Body.Bytes(), &created)
+	id := created["id"].(string)
+
+	rr = doRequest(t, srv, "PATCH", "/jobs/"+id+"/priority", `{"priority":"emergency"}`, raw)
+	if rr.Code != 200 {
+		t.Fatalf("priority update = %d: %s", rr.Code, rr.Body.String())
+	}
+	rr = doRequest(t, srv, "GET", "/jobs/"+id, "", raw)
+	var got map[string]any
+	json.Unmarshal(rr.Body.Bytes(), &got)
+	if got["priority"] != "emergency" {
+		t.Fatalf("priority = %v, want emergency", got["priority"])
+	}
+
+	// invalid priority value -> 400
+	rr = doRequest(t, srv, "PATCH", "/jobs/"+id+"/priority", `{"priority":"urgent"}`, raw)
+	if rr.Code != 400 {
+		t.Fatalf("invalid priority = %d, want 400: %s", rr.Code, rr.Body.String())
+	}
+
+	// once running, priority can no longer change
+	rr = doRequest(t, srv, "POST", "/jobs/"+id+"/cancel", "", raw)
+	if rr.Code != 200 {
+		t.Fatalf("cancel = %d: %s", rr.Code, rr.Body.String())
+	}
+	rr = doRequest(t, srv, "PATCH", "/jobs/"+id+"/priority", `{"priority":"low"}`, raw)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("priority update on cancelled job = %d, want 409: %s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestJobEvents(t *testing.T) {
 	srv, _, km := newTestServer(t)
 	raw, _, _ := km.Create("w", []string{"jobs:write", "jobs:read"})
@@ -343,6 +383,121 @@ func TestJobEvents(t *testing.T) {
 	events, _ := evs["events"].([]any)
 	if len(events) < 1 {
 		t.Fatalf("expected >=1 event, got %d", len(events))
+	}
+}
+
+func TestConfigExportImport(t *testing.T) {
+	srv, _, km := newTestServer(t)
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "weft.yaml")
+	srv.cfgPath = cfgPath
+	srv.cfg.Security.AdminAPIKey = "super-secret-admin-key"
+	raw, _, _ := km.Create("w", []string{"config:manage"})
+
+	rr := doRequest(t, srv, "GET", "/config/export", "", raw)
+	if rr.Code != 200 {
+		t.Fatalf("export = %d: %s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "network:") {
+		t.Fatalf("export missing network section: %s", body)
+	}
+	if strings.Contains(body, "super-secret-admin-key") {
+		t.Fatal("default export leaked admin_api_key")
+	}
+	if !strings.Contains(body, "<redacted>") {
+		t.Fatal("default export should show a <redacted> placeholder for admin_api_key")
+	}
+
+	// re-importing the redacted export must be rejected, not silently wipe
+	// the real secret on next restart.
+	rr = doRequest(t, srv, "POST", "/config/import", body, raw)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("import of redacted config = %d, want 400: %s", rr.Code, rr.Body.String())
+	}
+
+	// include_secrets=true round-trips the real value.
+	rr = doRequest(t, srv, "GET", "/config/export?include_secrets=true", "", raw)
+	if rr.Code != 200 {
+		t.Fatalf("export with secrets = %d: %s", rr.Code, rr.Body.String())
+	}
+	fullBody := rr.Body.String()
+	if !strings.Contains(fullBody, "super-secret-admin-key") {
+		t.Fatal("include_secrets=true export did not include the real admin_api_key")
+	}
+	rr = doRequest(t, srv, "POST", "/config/import", fullBody, raw)
+	if rr.Code != 200 {
+		t.Fatalf("import = %d: %s", rr.Code, rr.Body.String())
+	}
+	written, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(written), "super-secret-admin-key") {
+		t.Fatal("imported config was not written to cfgPath")
+	}
+
+	// a server with no configured path refuses import (no file to write to).
+	srv2, _, km2 := newTestServer(t)
+	raw2, _, _ := km2.Create("w", []string{"config:manage"})
+	rr = doRequest(t, srv2, "POST", "/config/import", fullBody, raw2)
+	if rr.Code != http.StatusNotImplemented {
+		t.Fatalf("import without cfgPath = %d, want 501: %s", rr.Code, rr.Body.String())
+	}
+
+	// malformed/invalid config is rejected before ever touching disk.
+	rr = doRequest(t, srv, "POST", "/config/import", "network:\n  listen: \"\"\n", raw)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("import of invalid config = %d, want 400: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestCronEndpoints(t *testing.T) {
+	srv, _, km := newTestServer(t)
+	raw, _, _ := km.Create("w", []string{"cron:manage"})
+
+	// no scheduler configured: empty list, not an error
+	rr := doRequest(t, srv, "GET", "/cron", "", raw)
+	if rr.Code != 200 {
+		t.Fatalf("cron list (no scheduler) = %d: %s", rr.Code, rr.Body.String())
+	}
+
+	ran := 0
+	sched := cron.New()
+	if err := sched.Register(cron.Job{
+		Name: "cleanup", Schedule: "0 3 * * *",
+		Run: func(ctx context.Context) error { ran++; return nil },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	srv.SetCronScheduler(sched)
+
+	rr = doRequest(t, srv, "GET", "/cron", "", raw)
+	if rr.Code != 200 {
+		t.Fatalf("cron list = %d: %s", rr.Code, rr.Body.String())
+	}
+	var listOut struct {
+		Jobs []struct {
+			Name     string `json:"name"`
+			Schedule string `json:"schedule"`
+		} `json:"jobs"`
+	}
+	json.Unmarshal(rr.Body.Bytes(), &listOut)
+	if len(listOut.Jobs) != 1 || listOut.Jobs[0].Name != "cleanup" {
+		t.Fatalf("cron list = %+v", listOut)
+	}
+
+	rr = doRequest(t, srv, "POST", "/cron/cleanup/run", "", raw)
+	if rr.Code != 200 {
+		t.Fatalf("cron run = %d: %s", rr.Code, rr.Body.String())
+	}
+	if ran != 1 {
+		t.Fatalf("job ran %d times, want 1", ran)
+	}
+
+	rr = doRequest(t, srv, "POST", "/cron/nope/run", "", raw)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("cron run unknown job = %d, want 404: %s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -431,6 +586,48 @@ func TestUnknownDestination(t *testing.T) {
 	rr := doRequest(t, srv, "POST", "/jobs", `{"input_ref":"x","profile":"vod-h264","destination_id":99}`, raw)
 	if rr.Code != 400 || !strings.Contains(rr.Body.String(), "unknown_destination") {
 		t.Fatalf("want unknown_destination, got %d %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestUnknownSourceServer(t *testing.T) {
+	srv, _, km := newTestServer(t)
+	raw, _, _ := km.Create("w", []string{"jobs:write"})
+	rr := doRequest(t, srv, "POST", "/jobs", `{"input_ref":"movies/x.mp4","profile":"vod-h264","source_server_id":99}`, raw)
+	if rr.Code != 400 || !strings.Contains(rr.Body.String(), "unknown_source_server") {
+		t.Fatalf("want unknown_source_server, got %d %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestJobCreateWithSourceServer(t *testing.T) {
+	srv, store, km := newTestServer(t)
+	raw, _, _ := km.Create("w", []string{"jobs:write", "jobs:read", "storage:manage"})
+
+	rr := doRequest(t, srv, "POST", "/storage/servers", `{"id":5,"type":"local","config":{"base_path":"./somewhere"}}`, raw)
+	if rr.Code != 201 {
+		t.Fatalf("register server = %d: %s", rr.Code, rr.Body.String())
+	}
+
+	rr = doRequest(t, srv, "POST", "/jobs", `{"input_ref":"movies/x.mp4","profile":"vod-h264","source_server_id":5}`, raw)
+	if rr.Code != 201 {
+		t.Fatalf("create = %d: %s", rr.Code, rr.Body.String())
+	}
+	var created map[string]any
+	json.Unmarshal(rr.Body.Bytes(), &created)
+	id := core.JobID(created["id"].(string))
+
+	job, err := store.LoadJob(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.SourceServerID != 5 {
+		t.Fatalf("SourceServerID = %d, want 5", job.SourceServerID)
+	}
+
+	rr = doRequest(t, srv, "GET", "/jobs/"+string(id), "", raw)
+	var got map[string]any
+	json.Unmarshal(rr.Body.Bytes(), &got)
+	if got["source_server_id"] != float64(5) {
+		t.Fatalf("GET /jobs/{id} source_server_id = %v, want 5", got["source_server_id"])
 	}
 }
 
@@ -538,6 +735,81 @@ func TestDeleteJob(t *testing.T) {
 	rr = doRequest(t, srv, "GET", "/jobs/"+id, "", raw)
 	if rr.Code != 404 {
 		t.Fatalf("get after delete = %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestDeleteJobPurgesStorageFiles is the regression test for DeleteJob only
+// clearing DB rows: before the fix, a job's published assets stayed on
+// destination storage forever after DELETE /jobs/{id}. Now the handler calls
+// Storage.Delete for every recorded output before removing the DB rows.
+func TestDeleteJobPurgesStorageFiles(t *testing.T) {
+	dir := t.TempDir()
+	srv, store, km := newTestServer(t)
+	srv.stbuild = func(ctx context.Context, destinationID int, destPath string) (core.Storage, error) {
+		return local.New(dir)
+	}
+	raw, _, _ := km.Create("w", []string{"jobs:read", "jobs:write"})
+
+	j := core.Job{ID: "jpurge", Status: core.JobCancelled, Priority: core.PriorityNormal, Profile: "vod-h264"}
+	if err := store.SaveJob(context.Background(), j); err != nil {
+		t.Fatal(err)
+	}
+	thumbDir := filepath.Join(dir, "thumbnails")
+	if err := os.MkdirAll(thumbDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	assetPath := filepath.Join(thumbDir, "movie_thumb_01.jpg")
+	if err := os.WriteFile(assetPath, []byte("fake-jpeg-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveTaskOutputs(context.Background(), "task1", "jpurge", []core.AssetRef{
+		{Kind: "thumbnail", Name: "movie_thumb_01.jpg", URI: "local:thumbnails/movie_thumb_01.jpg", Dir: "thumbnails"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rr := doRequest(t, srv, "DELETE", "/jobs/jpurge", "", raw)
+	if rr.Code != 200 {
+		t.Fatalf("delete = %d: %s", rr.Code, rr.Body.String())
+	}
+	if _, err := os.Stat(assetPath); !os.IsNotExist(err) {
+		t.Fatalf("asset file still exists after delete: err=%v", err)
+	}
+}
+
+// TestDeleteJobPurgeFilesOptOut verifies ?purge_files=false skips storage
+// deletion (e.g. when the destination path is shared with something else).
+func TestDeleteJobPurgeFilesOptOut(t *testing.T) {
+	dir := t.TempDir()
+	srv, store, km := newTestServer(t)
+	srv.stbuild = func(ctx context.Context, destinationID int, destPath string) (core.Storage, error) {
+		return local.New(dir)
+	}
+	raw, _, _ := km.Create("w", []string{"jobs:read", "jobs:write"})
+
+	j := core.Job{ID: "jkeep", Status: core.JobCancelled, Priority: core.PriorityNormal, Profile: "vod-h264"}
+	if err := store.SaveJob(context.Background(), j); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	assetPath := filepath.Join(dir, "keep.jpg")
+	if err := os.WriteFile(assetPath, []byte("keep-me"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveTaskOutputs(context.Background(), "task1", "jkeep", []core.AssetRef{
+		{Kind: "thumbnail", Name: "keep.jpg", URI: "local:keep.jpg"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rr := doRequest(t, srv, "DELETE", "/jobs/jkeep?purge_files=false", "", raw)
+	if rr.Code != 200 {
+		t.Fatalf("delete = %d: %s", rr.Code, rr.Body.String())
+	}
+	if _, err := os.Stat(assetPath); err != nil {
+		t.Fatalf("asset file should survive purge_files=false, stat err=%v", err)
 	}
 }
 
@@ -656,6 +928,60 @@ func TestCreateJobTrimAndThumbParams(t *testing.T) {
 	}
 }
 
+// TestTrimUpdateProfile verifies the post-hoc trim-update profile builds a
+// hls->upload graph and picks up trim_start/trim_end exactly like any other
+// profile's hls task — it reuses buildTasks' existing trim wiring, no
+// separate trim engine for "already published" vs "at creation time".
+func TestTrimUpdateProfile(t *testing.T) {
+	srv, store, km := newTestServer(t)
+	raw, _, _ := km.Create("w", []string{"jobs:write", "jobs:read"})
+	body := `{"input_ref":"movie.mp4","profile":"trim-update","name":"movie","trim_start":30,"trim_end":5}`
+	rr := doRequest(t, srv, "POST", "/jobs", body, raw)
+	if rr.Code != 201 {
+		t.Fatalf("create = %d: %s", rr.Code, rr.Body.String())
+	}
+	var created map[string]any
+	json.Unmarshal(rr.Body.Bytes(), &created)
+	id := core.JobID(created["id"].(string))
+	tasks, err := store.ListTasks(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kinds := map[string]core.Task{}
+	for _, tk := range tasks {
+		kinds[tk.Kind] = tk
+	}
+	if _, ok := kinds["thumbnail"]; ok {
+		t.Fatal("trim-update must not include a thumbnail task")
+	}
+	if _, ok := kinds["subtitle"]; ok {
+		t.Fatal("trim-update must not include a subtitle task")
+	}
+	hlsTask, ok := kinds["hls"]
+	if !ok {
+		t.Fatal("trim-update must include an hls task")
+	}
+	if hlsTask.Params["trim_start"] != float64(30) || hlsTask.Params["trim_end"] != float64(5) {
+		t.Fatalf("hls trim params = %v", hlsTask.Params)
+	}
+	if hlsTask.Params["name"] != "movie" {
+		t.Fatalf("hls name param = %v, want movie", hlsTask.Params["name"])
+	}
+	uploadTask, ok := kinds["upload"]
+	if !ok {
+		t.Fatal("trim-update must include an upload task")
+	}
+	found := false
+	for _, dep := range uploadTask.DependsOn {
+		if dep == hlsTask.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("upload task must depend on the hls task")
+	}
+}
+
 func TestGetAssetBase64(t *testing.T) {
 	dir := t.TempDir()
 	srv, store, km := newTestServer(t)
@@ -706,6 +1032,38 @@ func TestGetAssetBase64(t *testing.T) {
 	rr = doRequest(t, srv, "GET", "/jobs/jasset/assets/nope.jpg", "", raw)
 	if rr.Code != 404 {
 		t.Fatalf("missing asset = %d", rr.Code)
+	}
+}
+
+// TestGetAssetTooLarge is the regression test for the unbounded base64 asset
+// response: before the fix, handleGetAsset would read and base64-encode an
+// asset of any size into one JSON response. Now an asset whose recorded
+// Bytes exceeds maxAssetBytes is rejected with 413 before it's even opened.
+func TestGetAssetTooLarge(t *testing.T) {
+	dir := t.TempDir()
+	srv, store, km := newTestServer(t)
+	srv.stbuild = func(ctx context.Context, destinationID int, destPath string) (core.Storage, error) {
+		return local.New(dir)
+	}
+	raw, _, _ := km.Create("w", []string{"jobs:read"})
+	j := core.Job{ID: "jbig", Status: core.JobCompleted, Priority: core.PriorityNormal, Profile: "vod-h264"}
+	if err := store.SaveJob(context.Background(), j); err != nil {
+		t.Fatal(err)
+	}
+	// the file itself doesn't need to actually be huge — the recorded Bytes
+	// size is what the size check uses to reject before ever opening it.
+	if err := os.WriteFile(filepath.Join(dir, "huge.ts"), []byte("small-on-disk"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveTaskOutputs(context.Background(), "task1", "jbig", []core.AssetRef{
+		{Kind: "video", Name: "huge.ts", URI: "local:huge.ts", Bytes: maxAssetBytes + 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rr := doRequest(t, srv, "GET", "/jobs/jbig/assets/huge.ts", "", raw)
+	if rr.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized asset = %d: %s, want 413", rr.Code, rr.Body.String())
 	}
 }
 

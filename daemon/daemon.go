@@ -5,9 +5,12 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 
 	cfg "github.com/mohammadjaf013/weft/configs"
 	"github.com/mohammadjaf013/weft/core"
@@ -16,15 +19,18 @@ import (
 	"github.com/mohammadjaf013/weft/plugins/hls"
 	"github.com/mohammadjaf013/weft/plugins/masterplaylist"
 	"github.com/mohammadjaf013/weft/plugins/masterupdate"
+	"github.com/mohammadjaf013/weft/plugins/posterupload"
 	"github.com/mohammadjaf013/weft/plugins/subtitle"
 	"github.com/mohammadjaf013/weft/plugins/thumbnail"
 	"github.com/mohammadjaf013/weft/plugins/upload"
 	"github.com/mohammadjaf013/weft/plugins/videoenc"
 	"github.com/mohammadjaf013/weft/runtime/api"
+	"github.com/mohammadjaf013/weft/runtime/cron"
 	ffexec "github.com/mohammadjaf013/weft/runtime/executor/ffmpeg"
 	"github.com/mohammadjaf013/weft/runtime/metrics"
 	"github.com/mohammadjaf013/weft/runtime/registry"
 	"github.com/mohammadjaf013/weft/runtime/store/sqlite"
+	"github.com/mohammadjaf013/weft/runtime/sysinfo"
 	"github.com/mohammadjaf013/weft/runtime/webhook"
 	"github.com/mohammadjaf013/weft/runtime/worker"
 )
@@ -42,6 +48,7 @@ type Daemon struct {
 	km     *api.KeyManager
 	srv    *api.Server
 	wh     *webhook.Dispatcher
+	cronSched *cron.Scheduler
 
 	workers []*worker.Worker
 	pool    *workerPool
@@ -52,7 +59,7 @@ type Daemon struct {
 
 	// inputResolver overrides the default local-path InputRef resolver.
 	// nil means "use the daemon default".
-	inputResolver func(core.Job) (string, error)
+	inputResolver func(context.Context, core.Job) (string, error)
 
 	// Addr is the bound listener address after Serve starts (incl. ephemeral
 	// ports when Network.Listen is ":0").
@@ -71,8 +78,13 @@ type Options struct {
 	// PluginRegister, when non-nil, is called instead of the default plugin set.
 	PluginRegister func(reg *registry.Registry, c *cfg.Config) error
 	// InputResolver maps a job's InputRef to a local InputURI. When nil, the
-	// daemon uses its default resolver (local paths; remote schemes error).
-	InputResolver func(job core.Job) (string, error)
+	// daemon uses its default resolver (local paths; http(s) URLs and
+	// registered-storage-server sources are fetched into a local cache).
+	InputResolver func(ctx context.Context, job core.Job) (string, error)
+	// ConfigPath is the weft.yaml file this daemon was started from. When set,
+	// POST /config/import writes an updated config back to this path (applied
+	// on next restart, not hot-reloaded). Empty disables config import.
+	ConfigPath string
 }
 
 // Open assembles all components from a config (and optionally a pre-opened
@@ -122,19 +134,100 @@ func Open(c *cfg.Config, store *sqlite.Store, opts ...Options) (*Daemon, error) 
 
 	// API server
 	d.srv = api.NewServer(api.Options{
-		Store:    store,
-		Bus:      bus,
-		Sched:    sched,
-		SM:       sm,
-		Registry: reg,
-		Metrics:  m,
-		Config:   c,
-		Keys:     km,
-		Worker:   d.pool,
+		Store:      store,
+		Bus:        bus,
+		Sched:      sched,
+		SM:         sm,
+		Registry:   reg,
+		Metrics:    m,
+		Config:     c,
+		ConfigPath: o.ConfigPath,
+		Keys:       km,
+		Worker:     d.pool,
 		WorkerScaler: d.pool,
-		Storage:  d.storageForID,
+		Storage:    d.storageForID,
 	})
+
+	// Cron: cleanup/benchmark/health_scan, each also triggerable on demand via
+	// GET /cron + POST /cron/{job}/run (weft cron list/run). Registered after
+	// d.srv exists because the benchmark job calls d.srv.RunBenchmark.
+	d.cronSched = cron.New()
+	if sched := c.Cron.Cleanup.Schedule; sched != "" {
+		if err := d.cronSched.Register(cron.Job{
+			Name: "cleanup", Schedule: sched,
+			Run: d.runCleanupJob,
+		}); err != nil {
+			return nil, err
+		}
+	}
+	if sched := c.Cron.Benchmark.Schedule; sched != "" {
+		if err := d.cronSched.Register(cron.Job{
+			Name: "benchmark", Schedule: sched,
+			Run: func(ctx context.Context) error {
+				_, err := d.srv.RunBenchmark(ctx)
+				return err
+			},
+		}); err != nil {
+			return nil, err
+		}
+	}
+	if sched := c.Cron.HealthScan.Schedule; sched != "" {
+		if err := d.cronSched.Register(cron.Job{
+			Name: "health_scan", Schedule: sched,
+			Run: d.runHealthScanJob,
+		}); err != nil {
+			return nil, err
+		}
+	}
+	d.srv.SetCronScheduler(d.cronSched)
+
 	return d, nil
+}
+
+// runCleanupJob is the cron-triggered "cleanup" job: prune terminal-status
+// jobs past retention_hours and events past event_retention_days. Shares the
+// same store methods the interval-based pruners in serve.go use — this just
+// gives operators a schedule they can inspect (GET /cron) and trigger by hand
+// (weft cron run cleanup) on top of the automatic interval pruning.
+func (d *Daemon) runCleanupJob(ctx context.Context) error {
+	var errs []error
+	if hrs := d.cfg.Cron.Cleanup.RetentionHours; hrs > 0 {
+		cutoff := core.Now().Add(-time.Duration(hrs) * time.Hour)
+		if _, err := d.store.PruneJobs(ctx, cutoff); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if days := d.cfg.Cron.Cleanup.EventRetentionDays; days > 0 {
+		cutoff := core.Now().Add(-time.Duration(days) * 24 * time.Hour)
+		if _, err := d.store.PruneEvents(ctx, cutoff); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// runHealthScanJob samples host resources and publishes a NodeHealthSampled
+// event — raw data collection only; turning it into a composite Health Score
+// is a later refinement layered on these same samples, not built here.
+func (d *Daemon) runHealthScanJob(ctx context.Context) error {
+	base := d.cfg.Storage.Local.BasePath
+	if base == "" {
+		base = "."
+	}
+	snap, err := sysinfo.Collect(base)
+	if err != nil {
+		return err
+	}
+	payload, err := json.Marshal(snap)
+	if err != nil {
+		return err
+	}
+	evt := core.Event{ID: core.NewID("evt"), Kind: core.EvtNodeHealth, Payload: payload, CreatedAt: core.Now()}
+	if err := d.store.AppendEvent(ctx, evt); err != nil {
+		return err
+	}
+	d.bus.Publish(evt)
+	return nil
 }
 
 // registerPlugins enables the media plugins listed in config. The AI-subtitle
@@ -153,6 +246,7 @@ func registerPlugins(reg *registry.Registry, c *cfg.Config) error {
 		"master_playlist": &masterplaylist.Plugin{},
 		"master_update":   &masterupdate.Plugin{},
 		"upload":          &upload.Plugin{},
+		"poster_upload":   &posterupload.Plugin{},
 	}
 	for name, p := range media {
 		if enabled[name] {

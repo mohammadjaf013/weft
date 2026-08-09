@@ -32,15 +32,19 @@ Media pipelines are fragile. Weft is designed as a **durable agent**: every stat
 
 ## Features
 
-- **DAG job pipelines** — profiles define task graphs (`vod-h264`, `audio`, `thumbnail`, `subtitle-add`, `dub-add`, `ai-subtitle`); tasks run when all dependencies complete.
-- **Durable event sourcing** — SQLite (WAL) store; every transition and event commits atomically.
+- **DAG job pipelines** — profiles define task graphs (`vod-h264`, `audio`, `thumbnail`, `subtitle-add`, `dub-add`, `trim-update`, `poster-replace`, `ai-subtitle`); tasks run when all dependencies complete.
+- **Durable event sourcing** — SQLite (WAL) store; every transition, event, and matching webhook outbox row commits atomically in one transaction.
 - **Crash recovery** — workers lease tasks; expired leases are re-queued. No loss, no double-publish.
-- **Priority queues** — `emergency → high → normal → low → background`.
+- **Priority queues** — `emergency → high → normal → low → background`, changeable on a queued job at runtime (`weft jobs priority`).
+- **Smart concurrency** — worker pool auto-sizes to the host's CPU cores; an optional resource budget caps how much plugin-declared CPU/RAM cost can run at once, on top of measured-CPU admission gating.
+- **Remote sources, not just remote destinations** — a job's input can be a relative path on a registered storage server or a direct `http(s)://` URL, fetched into a local cache automatically — not just local disk.
 - **AI subtitles** — whisper.cpp (offline) and/or Gemini; `--provider whisper|gemini|hybrid`, `--src-lang` + `--lang` for transcription-then-translation.
 - **Live progress** — whisper `-pp` and ffmpeg `-progress pipe:1` drive real progress events, surfaced via API and webhooks.
-- **Webhooks** — at-least-once delivery, `X-Weft-Signature: HMAC-SHA256`, exponential backoff, dead-letter replay.
+- **Live CLI dashboard** — `weft dashboard`: jobs, queue, workers, and host resources refreshed on an interval, with keyboard cancel/pause/resume/delete.
+- **Webhooks** — at-least-once delivery, `X-Weft-Signature: HMAC-SHA256`, exponential backoff, dead-letter replay (`weft webhooks replay`).
 - **Multi-storage** — local, SSH/SFTP, and S3 (hand-rolled SigV4, no SDK).
 - **Master playlist recovery** — `POST /storage/rebuild-master` regenerates `playlist.m3u8` from whatever is actually on disk (recovers corrupted/old-binary masters).
+- **Config export/import & cron** — back up/restore the running config; `cleanup`/`benchmark`/`health_scan` run on a schedule and are also triggerable by hand.
 - **Security** — argon2id API keys with scopes; TLS supported.
 - **Static binary** — pure Go, `modernc.org/sqlite` (no CGO), cross-compiled for linux/amd64 + linux/arm64.
 
@@ -144,12 +148,15 @@ runtime/   Layer 2 — implementations of core interfaces.
   webhook/        HMAC-signed at-least-once delivery, backoff, dead letter.
   metrics/        Prometheus text export (hand-rolled, no deps).
   api/            chi REST API + argon2id API keys + scopes.
-  worker/         worker loop (reserve → execute → mark done).
+  worker/         worker loop (reserve → execute → mark done), resource budget.
+  cron/           cleanup/benchmark/health_scan scheduler.
 daemon/    The single assembly point (config → all components → Serve).
-plugins/   Media + storage plugins (hls, subtitle, ai-subtitle, upload, ...).
-profiles/  Profile → DAG templates (vod-h264, audio, ai-subtitle, ...).
+plugins/   Media + storage plugins (hls, subtitle, ai-subtitle, upload,
+           poster_upload, ...).
+profiles/  Profile → DAG templates (vod-h264, audio, ai-subtitle,
+           trim-update, poster-replace, ...).
 configs/   weft.yaml schema + startup validation.
-cli/       Thin CLI over the API (serve, doctor, jobs, keys, ...).
+cli/       Thin CLI over the API (serve, doctor, jobs, keys, dashboard, ...).
 e2e/       Full lifecycle test over the real daemon (fake ffmpeg).
 chaos/     Failure injection: plugin panic, lease expiry, webhook retry.
 ```
@@ -158,12 +165,14 @@ chaos/     Failure injection: plugin panic, lease expiry, webhook retry.
 
 ```
 queued → reserved → running → uploading → completed
+                       ↕ paused/resumed
              └──────── (any step fails) ───────▶ failed
 ```
 
 - A task becomes runnable the moment all DAG dependencies are done.
-- Every state change + its event commits in **one transaction**.
+- Every state change + its event + any matching webhook outbox row commits in **one transaction**.
 - Workers lease tasks; a crashed worker's task is **re-queued** when the lease expires.
+- A resumed job behaves exactly like a running one for every later transition — pausing is not a dead end.
 
 ---
 
@@ -206,15 +215,24 @@ weft version                           print version
 weft jobs list [--status S] [--priority P] [--limit N]
 weft jobs get <id>
 weft jobs create <input_ref> --profile <name> [--priority P]
-                [--destination N] [--path P] [--name N] [--lang L]
-                [--src-lang S] [--provider whisper|gemini|hybrid]
-weft jobs events <id>
+                [--destination N] [--source-server N] [--path P] [--name N]
+                [--lang L] [--src-lang S] [--provider whisper|gemini|hybrid]
+                [--trim-start S] [--trim-end S]
+                [--thumb-count N | --thumb-at S] [--thumb-size WxH|original]
+                [--forced] [--default]
+weft jobs events <id> | log <id> <task_id> | asset <id> <name>
 weft jobs action <id> <cancel|retry|pause|resume>
+weft jobs priority <id> <emergency|high|normal|low|background>
+weft jobs delete <id>
 
 weft keys create <name> <scope...> | keys list | keys delete <id>
-weft webhooks create <url> <event...> [--secret S] | list | delete <id>
+weft webhooks create <url> <event...> [--secret S] | list | delete <id> | replay <event_id>
 weft storage list | add <id> <type> [--host H] [--user U]
-weft queue | workers | profiles | plugins | metrics | benchmark | system
+weft queue | workers [scale <n>] | profiles | plugins | metrics | system
+weft benchmark [run] | benchmark get
+weft config export [--out F] [--include-secrets] | config import <file>
+weft cron list | cron run <cleanup|benchmark|health_scan>
+weft dashboard [--interval 2s]     # live TUI: jobs/queue/workers/system, select+act
 ```
 
 All remote commands accept `--api <url>` and `--key <token>`.
@@ -227,17 +245,22 @@ All remote commands accept `--api <url>` and `--key <token>`.
 |---|---|---|
 | GET | `/health` | — |
 | GET/POST | `/jobs` | `jobs:read` / `jobs:write` |
-| GET | `/jobs/{id}`, `/jobs/{id}/events` | `jobs:read` |
+| GET | `/jobs/{id}`, `/jobs/{id}/events`, `/jobs/{id}/tasks/{taskID}/log`, `/jobs/{id}/assets/{name}` | `jobs:read` |
+| DELETE | `/jobs/{id}` | `jobs:write` |
+| PATCH | `/jobs/{id}/priority` | `jobs:write` |
 | POST | `/jobs/{id}/{action}` (cancel/retry/pause/resume) | `jobs:write` |
 | GET | `/queue`, `/workers` | `queue:read`, `workers:read` |
+| POST | `/workers/scale` | `workers:write` |
 | GET/POST | `/storage/servers` | `storage:manage` |
 | POST | `/storage/rebuild-master` | `storage:manage` |
 | GET/POST/DELETE | `/webhooks` (+ `/webhooks/{id}/replay`) | `webhooks:manage` |
 | GET/POST/DELETE | `/keys` | `keys:manage` |
 | GET | `/profiles`, `/plugins` | `profiles:read`, `plugins:read` |
 | POST/GET | `/benchmark`, `/metrics`, `/system` | `metrics:read` |
+| GET/POST | `/config/export`, `/config/import` | `config:manage` |
+| GET/POST | `/cron`, `/cron/{job}/run` | `cron:manage` |
 
-Error responses are structured: `{"error": {"code": "...", "message": "..."}}`.
+Error responses are structured: `{"error": {"code": "...", "message": "..."}}`. Full reference (request/response shapes, worked examples): [docs/REFERENCE.md](docs/REFERENCE.md).
 
 ---
 

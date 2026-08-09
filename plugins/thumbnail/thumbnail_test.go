@@ -151,6 +151,56 @@ func TestProcessCustomThumbCount(t *testing.T) {
 	}
 }
 
+func TestProcessSingleThumbAt(t *testing.T) {
+	mediautil.WorkRoot = t.TempDir()
+	fake := ffexec.NewFake(core.Result{ExitCode: 0}, nil)
+	in := core.TaskInput{
+		TaskID:   "t3b",
+		InputRef: "s3://in/movie.mp4",
+		InputURI: "local:work/movie.mp4",
+		Params: map[string]any{
+			"thumb_at":   float64(83),
+			"thumb_size": "640x360",
+		},
+		Executor: fake,
+	}
+	out, err := (&Plugin{}).Process(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if len(out.Assets) != 1 {
+		t.Fatalf("thumb_at mode should produce exactly 1 asset, got %d", len(out.Assets))
+	}
+	if out.Assets[0].Kind != "thumbnail" || out.Assets[0].Dir != "thumbnails" {
+		t.Errorf("asset = %+v, want kind=thumbnail dir=thumbnails", out.Assets[0])
+	}
+	args := fake.RecordedArgs()
+	if len(args) != 1 {
+		t.Fatalf("thumb_at mode should run a single ffmpeg, got %d", len(args))
+	}
+	var seek, frames, scale bool
+	for i, a := range args[0] {
+		if a == "-ss" && i+1 < len(args[0]) && args[0][i+1] == "83.000" {
+			seek = true
+		}
+		if a == "-frames:v" {
+			frames = true
+		}
+		if strings.Contains(a, "scale=640:360") {
+			scale = true
+		}
+	}
+	if !seek {
+		t.Errorf("thumb_at missing -ss 83.000: %v", args[0])
+	}
+	if !frames {
+		t.Errorf("thumb_at missing -frames:v: %v", args[0])
+	}
+	if !scale {
+		t.Errorf("thumb_at missing scale=640:360: %v", args[0])
+	}
+}
+
 func TestProcessCustomThumbOriginalSize(t *testing.T) {
 	mediautil.WorkRoot = t.TempDir()
 	fake := ffexec.NewFake(core.Result{ExitCode: 0}, nil)

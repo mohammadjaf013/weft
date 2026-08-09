@@ -75,6 +75,36 @@ func (m *memStore) ListJobs(ctx context.Context, filter JobFilter) ([]Job, error
 	return out, nil
 }
 
+func (m *memStore) ListActiveJobs(ctx context.Context) ([]Job, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []Job{}
+	for _, j := range m.jobs {
+		switch j.Status {
+		case JobCompleted, JobCancelled, JobFailed, JobTimeout, JobDeadLetter:
+			continue
+		}
+		out = append(out, j)
+	}
+	return out, nil
+}
+
+func (m *memStore) ListTasksForJobs(ctx context.Context, jobIDs []JobID) ([]Task, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	want := make(map[JobID]bool, len(jobIDs))
+	for _, id := range jobIDs {
+		want[id] = true
+	}
+	out := []Task{}
+	for _, t := range m.tasks {
+		if want[t.JobID] {
+			out = append(out, t)
+		}
+	}
+	return out, nil
+}
+
 func (m *memStore) SaveTask(ctx context.Context, t Task) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

@@ -51,7 +51,10 @@ func (p *Plugin) Process(ctx context.Context, in core.TaskInput) (core.TaskOutpu
 	// Audio-only input (mp3 and friends) → audio HLS; otherwise a full
 	// multi-rendition video HLS set.
 	hasAudio := mediautil.HasAudio(in)
-	trim := mediautil.TrimFromParams(in.Params, mediautil.Duration(in))
+	trim, err := mediautil.TrimFromParams(in.Params, mediautil.Duration(in))
+	if err != nil {
+		return core.TaskOutput{}, fmt.Errorf("hls: %w", err)
+	}
 	if isAudioOnly(in) {
 		in.Params["argv"] = mediautil.AudioHLSArgs(in.InputURI, outDir, base, 6, "", trim)
 	} else {

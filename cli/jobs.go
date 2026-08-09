@@ -5,10 +5,10 @@ import (
 	"fmt"
 )
 
-// cmdJobs handles `weft jobs ...`: list, get, create, events, log, asset, delete, action.
+// cmdJobs handles `weft jobs ...`: list, get, create, events, log, asset, delete, action, priority.
 func cmdJobs(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("jobs: missing subcommand (list|get|create|events|log|asset|delete|action)")
+		return fmt.Errorf("jobs: missing subcommand (list|get|create|events|log|asset|delete|action|priority)")
 	}
 	sub := args[0]
 	rest := args[1:]
@@ -29,8 +29,10 @@ func cmdJobs(args []string) error {
 		return jobsDelete(rest)
 	case "action":
 		return jobsAction(rest)
+	case "priority":
+		return jobsPriority(rest)
 	default:
-		return fmt.Errorf("jobs: unknown subcommand %q (list|get|create|events|log|asset|delete|action)", sub)
+		return fmt.Errorf("jobs: unknown subcommand %q (list|get|create|events|log|asset|delete|action|priority)", sub)
 	}
 }
 
@@ -166,7 +168,11 @@ func jobsCreate(args []string) error {
 	trimStart := fs.Float64("trim-start", 0, "skip N seconds from the beginning of the clip before HLS packaging")
 	trimEnd := fs.Float64("trim-end", 0, "cut N seconds off the end of the clip before HLS packaging")
 	thumbCount := fs.Int("thumb-count", 0, "produce exactly N evenly-spaced thumbnails instead of poster/sprite/stills")
-	thumbSize := fs.String("thumb-size", "", "custom thumbnail size: 1080x1080 or original (requires --thumb-count)")
+	thumbSize := fs.String("thumb-size", "", "custom thumbnail size: 1080x1080 or original (requires --thumb-count or --thumb-at)")
+	thumbAt := fs.Float64("thumb-at", 0, "capture a single frame at this offset in seconds instead of poster/sprite/stills")
+	sourceServer := fs.Int("source-server", 0, "fetch input_ref as a relative path from this registered storage server instead of local disk")
+	forced := fs.Bool("forced", false, "mark this subtitle track FORCED=YES (--profile subtitle-add)")
+	defaultTrack := fs.Bool("default", false, "mark this subtitle track DEFAULT=YES (--profile subtitle-add)")
 	rf, err := parseRemote(fs, args)
 	if err != nil {
 		return err
@@ -184,7 +190,15 @@ func jobsCreate(args []string) error {
 		Status string   `json:"status"`
 		Tasks  []string `json:"tasks"`
 	}
-	body := jobsCreateBody(pos[0], *profile, *priority, *dest, *lang, *srcLang, *name, *path, *deleteSource, *provider, *trimStart, *trimEnd, *thumbCount, *thumbSize)
+	body := jobsCreateBody(jobsCreateOpts{
+		InputRef: pos[0], Profile: *profile, Priority: *priority, Dest: *dest,
+		Lang: *lang, SrcLang: *srcLang, Name: *name, Path: *path,
+		DeleteSource: *deleteSource, Provider: *provider,
+		TrimStart: *trimStart, TrimEnd: *trimEnd,
+		ThumbCount: *thumbCount, ThumbSize: *thumbSize, ThumbAt: *thumbAt,
+		SourceServer: *sourceServer,
+		Forced:       *forced, DefaultTrack: *defaultTrack,
+	})
 	err = c.post("/jobs", body, &out)
 	if err != nil {
 		return err
@@ -196,44 +210,83 @@ func jobsCreate(args []string) error {
 	return nil
 }
 
+// jobsCreateOpts holds every `weft jobs create` flag. A struct (not another
+// positional parameter) because this list has grown past the point where
+// positional args stay readable — see jobsCreateBody.
+type jobsCreateOpts struct {
+	InputRef, Profile, Priority string
+	Dest                        int
+	Lang, SrcLang, Name, Path   string
+	DeleteSource                bool
+	Provider                    string
+	TrimStart, TrimEnd          float64
+	ThumbCount                  int
+	ThumbSize                   string
+	// ThumbAt, when > 0, captures a single frame at this offset (seconds)
+	// instead of the default poster/sprite/stills or the --thumb-count set.
+	ThumbAt float64
+	// SourceServer, when set, means InputRef is a relative path resolved
+	// against this registered storage server instead of a local path.
+	SourceServer int
+	// Forced/DefaultTrack set the subtitle #EXT-X-MEDIA flags for
+	// --profile subtitle-add (ignored otherwise).
+	Forced       bool
+	DefaultTrack bool
+}
+
 // jobsCreateBody builds the /jobs payload from CLI flags (separate so the flag
 // plumbing is unit-testable without an HTTP round trip).
-func jobsCreateBody(inputRef, profile, priority string, dest int, lang, srcLang, name, path string, deleteSource bool, provider string, trimStart, trimEnd float64, thumbCount int, thumbSize string) map[string]any {
+func jobsCreateBody(o jobsCreateOpts) map[string]any {
 	body := map[string]any{
-		"input_ref":      inputRef,
-		"profile":        profile,
-		"priority":       priority,
-		"destination_id": dest,
+		"input_ref":      o.InputRef,
+		"profile":        o.Profile,
+		"priority":       o.Priority,
+		"destination_id": o.Dest,
 	}
-	if lang != "" {
-		body["lang"] = lang
+	if o.Lang != "" {
+		body["lang"] = o.Lang
 	}
-	if srcLang != "" {
-		body["src_lang"] = srcLang
+	if o.SrcLang != "" {
+		body["src_lang"] = o.SrcLang
 	}
-	if name != "" {
-		body["name"] = name
+	if o.Name != "" {
+		body["name"] = o.Name
 	}
-	if path != "" {
-		body["path"] = path
+	if o.Path != "" {
+		body["path"] = o.Path
 	}
-	if deleteSource {
+	if o.DeleteSource {
 		body["delete_source"] = true
 	}
-	if provider != "" {
-		body["provider"] = provider
+	if o.Provider != "" {
+		body["provider"] = o.Provider
 	}
-	if trimStart > 0 {
-		body["trim_start"] = trimStart
+	if o.TrimStart > 0 {
+		body["trim_start"] = o.TrimStart
 	}
-	if trimEnd > 0 {
-		body["trim_end"] = trimEnd
+	if o.TrimEnd > 0 {
+		body["trim_end"] = o.TrimEnd
 	}
-	if thumbCount > 0 {
-		body["thumb_count"] = thumbCount
-		if thumbSize != "" {
-			body["thumb_size"] = thumbSize
+	if o.ThumbCount > 0 {
+		body["thumb_count"] = o.ThumbCount
+		if o.ThumbSize != "" {
+			body["thumb_size"] = o.ThumbSize
 		}
+	}
+	if o.ThumbAt > 0 {
+		body["thumb_at"] = o.ThumbAt
+		if o.ThumbSize != "" {
+			body["thumb_size"] = o.ThumbSize
+		}
+	}
+	if o.SourceServer != 0 {
+		body["source_server_id"] = o.SourceServer
+	}
+	if o.Forced {
+		body["forced"] = true
+	}
+	if o.DefaultTrack {
+		body["default"] = true
 	}
 	return body
 }
@@ -320,6 +373,31 @@ func jobsAction(args []string) error {
 		return err
 	}
 	fmt.Printf("job %s -> %s\n", out.ID, out.Status)
+	return nil
+}
+
+// jobsPriority changes a queued/reserved job's priority so it can jump (or
+// drop back in) the queue without being cancelled and resubmitted.
+func jobsPriority(args []string) error {
+	fs := remoteFlagSet("jobs priority")
+	rf, err := parseRemote(fs, args)
+	if err != nil {
+		return err
+	}
+	pos := fs.Args()
+	if len(pos) < 2 {
+		return fmt.Errorf("jobs priority: <id> <emergency|high|normal|low|background> required")
+	}
+	id, priority := pos[0], pos[1]
+	c := newClient(rf)
+	var out struct {
+		ID       string `json:"id"`
+		Priority string `json:"priority"`
+	}
+	if err := c.patch("/jobs/"+id+"/priority", map[string]any{"priority": priority}, &out); err != nil {
+		return err
+	}
+	fmt.Printf("job %s priority -> %s\n", out.ID, out.Priority)
 	return nil
 }
 

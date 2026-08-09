@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -34,6 +35,61 @@ func TestStoreRoundTrip(t *testing.T) {
 	got, _ = store.LoadJob(ctx, "j1")
 	if got.Status != core.JobRunning {
 		t.Fatalf("expected running, got %s", got.Status)
+	}
+}
+
+func TestStoreSourceServerIDRoundTrip(t *testing.T) {
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	j := core.Job{ID: "jsrc", Status: core.JobQueued, Priority: core.PriorityNormal, InputRef: "movies/foo.mp4", SourceServerID: 7}
+	if err := store.SaveJob(ctx, j); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.LoadJob(ctx, "jsrc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SourceServerID != 7 {
+		t.Fatalf("SourceServerID = %d, want 7", got.SourceServerID)
+	}
+
+	list, err := store.ListJobs(ctx, core.JobFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, lj := range list {
+		if lj.ID == "jsrc" {
+			found = true
+			if lj.SourceServerID != 7 {
+				t.Fatalf("ListJobs SourceServerID = %d, want 7", lj.SourceServerID)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("job not found in ListJobs")
+	}
+
+	active, err := store.ListActiveJobs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found = false
+	for _, aj := range active {
+		if aj.ID == "jsrc" {
+			found = true
+			if aj.SourceServerID != 7 {
+				t.Fatalf("ListActiveJobs SourceServerID = %d, want 7", aj.SourceServerID)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("job not found in ListActiveJobs")
 	}
 }
 
@@ -125,6 +181,91 @@ func TestStoreOutboxLifecycle(t *testing.T) {
 	rows, _ = ob.ListPending(ctx, 10, core.Now().Add(1))
 	if len(rows) != 0 {
 		t.Fatal("dead-lettered row should not be pending")
+	}
+}
+
+// TestStoreOutboxEnqueuedSameTransaction is the regression test for the
+// outbox durability gap: before the fix, outbox rows were enqueued by a
+// separate async subscriber reading the event bus AFTER the state-change
+// transaction had already committed, so a crash in between could silently
+// drop a webhook delivery. Now SaveJobEvent's insertEventTx enqueues matching
+// outbox rows in the SAME transaction — this asserts the outbox row exists
+// immediately after SaveJobEvent returns, with no separate Enqueue call and
+// no wait for a background goroutine.
+func TestStoreOutboxEnqueuedSameTransaction(t *testing.T) {
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	if err := store.SaveWebhook(ctx, Webhook{ID: "wh1", URL: "https://x/h", Secret: "s", Events: []string{"job.completed"}, MaxRetries: 5}); err != nil {
+		t.Fatal(err)
+	}
+
+	job := core.Job{ID: "jtx", Status: core.JobUploading, Priority: core.PriorityNormal}
+	evt := core.Event{ID: "evt-tx", JobID: "jtx", Kind: core.EvtJobFinished, CreatedAt: core.Now()}
+	if err := store.SaveJobEvent(ctx, job, evt); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := store.Outbox().ListPending(ctx, 10, core.Now().Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].EventID != "evt-tx" || rows[0].WebhookID != "wh1" {
+		t.Fatalf("outbox rows after SaveJobEvent = %v, want one row for evt-tx/wh1", rows)
+	}
+
+	// A non-matching event kind must NOT enqueue a row for this webhook (it
+	// only subscribes to job.completed).
+	evt2 := core.Event{ID: "evt-tx2", JobID: "jtx", Kind: core.EvtJobProgress, CreatedAt: core.Now()}
+	if err := store.SaveTaskEvent(ctx, core.Task{ID: "ttx", JobID: "jtx", Kind: "video_encode"}, evt2); err != nil {
+		t.Fatal(err)
+	}
+	rows, _ = store.Outbox().ListPending(ctx, 10, core.Now().Add(time.Second))
+	if len(rows) != 1 {
+		t.Fatalf("non-matching event must not enqueue an outbox row, got %v", rows)
+	}
+}
+
+// TestStoreListJobsDefaultLimit is the regression test for unbounded default
+// job listing: before the fix, ListJobs with no Limit returned every job ever
+// created. Also exercises the LIMIT/ORDER BY ordering bug this fix corrected
+// (LIMIT was being concatenated into the WHERE clause before ORDER BY, which
+// SQLite rejects as invalid syntax whenever a Limit was set).
+func TestStoreListJobsDefaultLimit(t *testing.T) {
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	for i := 0; i < 150; i++ {
+		job := core.Job{ID: core.JobID(fmt.Sprintf("job-%03d", i)), Status: core.JobQueued, Priority: core.PriorityNormal}
+		if err := store.SaveJob(ctx, job); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	jobs, err := store.ListJobs(ctx, core.JobFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != defaultJobListLimit {
+		t.Fatalf("unfiltered ListJobs returned %d jobs, want default limit %d", len(jobs), defaultJobListLimit)
+	}
+
+	// an explicit Limit combined with a WHERE-clause filter must not hit the
+	// LIMIT-before-ORDER-BY SQL syntax error.
+	jobs, err = store.ListJobs(ctx, core.JobFilter{Status: core.JobQueued, Limit: 5})
+	if err != nil {
+		t.Fatalf("ListJobs with status filter + limit: %v", err)
+	}
+	if len(jobs) != 5 {
+		t.Fatalf("filtered+limited ListJobs returned %d jobs, want 5", len(jobs))
 	}
 }
 
@@ -241,6 +382,53 @@ func TestStoreWebhookAndKeys(t *testing.T) {
 	servers, _ := store.ListStorageServers(ctx)
 	if len(servers) != 1 || servers[0].Config["path"] != "/srv" {
 		t.Fatalf("servers = %v", servers)
+	}
+}
+
+func TestStoreUpdateJobPriority(t *testing.T) {
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	if err := store.SaveJob(ctx, core.Job{ID: "jq", Status: core.JobQueued, Priority: core.PriorityLow}); err != nil {
+		t.Fatal(err)
+	}
+	ok, err := store.UpdateJobPriority(ctx, "jq", core.PriorityEmergency)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected UpdateJobPriority to succeed for a queued job")
+	}
+	got, err := store.LoadJob(ctx, "jq")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Priority != core.PriorityEmergency {
+		t.Fatalf("priority = %s, want emergency", got.Priority)
+	}
+
+	// a running job's priority must NOT change (reordering can't affect it
+	// anymore, and silently accepting the write would misrepresent that).
+	if err := store.SaveJob(ctx, core.Job{ID: "jr", Status: core.JobRunning, Priority: core.PriorityLow}); err != nil {
+		t.Fatal(err)
+	}
+	ok, err = store.UpdateJobPriority(ctx, "jr", core.PriorityEmergency)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("expected UpdateJobPriority to refuse a running job")
+	}
+	got, err = store.LoadJob(ctx, "jr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Priority != core.PriorityLow {
+		t.Fatalf("running job's priority changed to %s, want unchanged low", got.Priority)
 	}
 }
 

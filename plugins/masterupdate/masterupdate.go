@@ -44,6 +44,8 @@ func (p *Plugin) Process(ctx context.Context, in core.TaskInput) (core.TaskOutpu
 	if kind == "" {
 		kind = "subtitle"
 	}
+	forced := mediautil.ParamBool(in.Params, "forced", false)
+	isDefault := mediautil.ParamBool(in.Params, "default", false)
 
 	// The published master playlist is always named playlist.m3u8 (the hls
 	// plugin writes it as the master for the whole ladder).
@@ -67,7 +69,7 @@ func (p *Plugin) Process(ctx context.Context, in core.TaskInput) (core.TaskOutpu
 		}
 	}
 
-	updated, err := updatePlaylist(string(b), kind, lang, uri)
+	updated, err := updatePlaylist(string(b), kind, lang, uri, forced, isDefault)
 	if err != nil {
 		return core.TaskOutput{}, err
 	}
@@ -81,8 +83,9 @@ func (p *Plugin) Process(ctx context.Context, in core.TaskInput) (core.TaskOutpu
 
 // updatePlaylist adds or replaces an EXT-X-MEDIA track for the given language.
 // Subtitle tracks go in the "subs" group; audio tracks in "audio". The group
-// is referenced from every EXT-X-STREAM-INF line.
-func updatePlaylist(master, kind, lang, uri string) (string, error) {
+// is referenced from every EXT-X-STREAM-INF line. forced/isDefault set the
+// FORCED/DEFAULT attributes (both default to NO/false when not requested).
+func updatePlaylist(master, kind, lang, uri string, forced, isDefault bool) (string, error) {
 	group := "subs"
 	if kind == "audio" {
 		group = "audio"
@@ -114,8 +117,8 @@ func updatePlaylist(master, kind, lang, uri string) (string, error) {
 	}
 
 	newMedia := fmt.Sprintf(
-		`#EXT-X-MEDIA:TYPE=%s,GROUP-ID="%s",NAME="%s",DEFAULT=NO,AUTOSELECT=YES,FORCED=NO,LANGUAGE="%s",URI="%s"`,
-		mediaType, group, langName(lang), lang, uri,
+		`#EXT-X-MEDIA:TYPE=%s,GROUP-ID="%s",NAME="%s",DEFAULT=%s,AUTOSELECT=YES,FORCED=%s,LANGUAGE="%s",URI="%s"`,
+		mediaType, group, langName(lang), yesNo(isDefault), yesNo(forced), lang, uri,
 	)
 	if kind == "subtitle" {
 		newMedia += `,CHARACTERISTICS="public.accessibility.transcribes-spoken-dialog"`
@@ -147,6 +150,13 @@ func updatePlaylist(master, kind, lang, uri string) (string, error) {
 		writeMedia(&b, media)
 	}
 	return b.String(), nil
+}
+
+func yesNo(b bool) string {
+	if b {
+		return "YES"
+	}
+	return "NO"
 }
 
 func writeMedia(b *strings.Builder, media []string) {

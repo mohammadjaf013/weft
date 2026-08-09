@@ -107,8 +107,14 @@ type Job struct {
 	// DestPath is an optional subdirectory under the destination storage's
 	// base path (e.g. "movie" or "series"). Empty means the storage root.
 	// Lets one storage server fan out to many directories.
-	DestPath  string
-	InputRef  string
+	DestPath string
+	// SourceServerID, when non-zero, means InputRef is a relative path (not a
+	// local filesystem path or a bare URL) resolved against a REGISTERED
+	// storage server's root — the same servers already used for job output
+	// (weft storage add). 0 means InputRef is resolved the old way: a local
+	// path, or a directly-fetchable http(s):// URL.
+	SourceServerID int
+	InputRef       string
 	Verified  bool
 	// DeleteSource removes the source input file from disk once the job has
 	// completed successfully (upload finished). Safe default is false.

@@ -20,33 +20,13 @@ import (
 	"github.com/mohammadjaf013/weft/runtime/store/sqlite"
 )
 
-// CoreEvent → wire event mapping. Keep this mapping in ONE place — the
-// dispatcher. Don't let either naming style leak into the other layer.
-var wireNames = map[core.EventKind]string{
-	core.EvtJobCreated:       "job.created",
-	core.EvtJobStarted:       "job.started",
-	core.EvtJobProgress:      "job.progress",
-	core.EvtJobPaused:        "job.paused",
-	core.EvtJobResumed:       "job.resumed",
-	core.EvtJobCancelled:     "job.cancelled",
-	core.EvtJobFinished:      "job.completed",
-	core.EvtJobFailed:        "job.failed",
-	core.EvtTaskProgress:     "task.progress",
-	core.EvtStorageUploaded:  "storage.uploaded",
-	core.EvtStorageFailed:    "storage.failed",
-	core.EvtPipelineStarted:  "pipeline.started",
-	core.EvtPipelineFinished: "pipeline.finished",
-	core.EvtPluginStarted:    "plugin.started",
-	core.EvtPluginFinished:   "plugin.finished",
-	core.EvtNodeJoined:       "node.joined",
-	core.EvtNodeLeft:         "node.left",
-}
-
+// WireName delegates to core.WireName — the CoreEvent → wire event mapping
+// now lives in core (core/wirename.go) so runtime/store/sqlite can reuse it
+// when enqueueing outbox rows in the same transaction as the event, without
+// an import cycle (this package already imports runtime/store/sqlite). Kept
+// here as a thin wrapper for existing callers in this package/tests.
 func WireName(k core.EventKind) string {
-	if n, ok := wireNames[k]; ok {
-		return n
-	}
-	return string(k)
+	return core.WireName(k)
 }
 
 // Dispatcher is the outbox reader + deliverer.

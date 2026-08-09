@@ -15,6 +15,11 @@ type Config struct {
 		Mode          string  `yaml:"mode"`
 		MaxCPUPercent float64 `yaml:"max_cpu_percent"`
 		MaxLoadAvg    float64 `yaml:"max_load_average"`
+		// MaxEstimatedCPUCores/MaxEstimatedRAMMB cap the SUM of in-flight
+		// tasks' declared Capabilities() cost (not measured usage — see
+		// runtime/worker.Budget). 0 = unlimited for that dimension.
+		MaxEstimatedCPUCores float64 `yaml:"max_estimated_cpu_cores"`
+		MaxEstimatedRAMMB    int     `yaml:"max_estimated_ram_mb"`
 	} `yaml:"scheduler"`
 	Workers struct {
 		Min int `yaml:"min"`
@@ -114,7 +119,7 @@ func Default() *Config {
 	c.Workers.LeaseTTLSeconds = 300
 	c.Queue.Priorities = []string{"emergency", "high", "normal", "low", "background"}
 	c.Workflow.DefaultTimeoutSeconds = 3600
-	c.Plugins.Enabled = []string{"ffmpeg-video", "ffmpeg-audio", "subtitle", "thumbnail", "hls", "master_playlist", "master_update", "upload", "storage-local", "storage-ssh", "storage-s3", "ai-subtitle"}
+	c.Plugins.Enabled = []string{"ffmpeg-video", "ffmpeg-audio", "subtitle", "thumbnail", "hls", "master_playlist", "master_update", "upload", "poster_upload", "storage-local", "storage-ssh", "storage-s3", "ai-subtitle"}
 	c.Network.Listen = "127.0.0.1:8443"
 	c.Network.TLS = "off"
 	c.Security.APIKeys = true

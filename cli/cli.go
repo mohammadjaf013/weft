@@ -57,6 +57,12 @@ func Run(args []string) error {
 		return cmdBenchmark(args[1:])
 	case "system":
 		return cmdSystem(args[1:])
+	case "config":
+		return cmdConfig(args[1:])
+	case "cron":
+		return cmdCron(args[1:])
+	case "dashboard":
+		return cmdDashboard(args[1:])
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
@@ -101,13 +107,19 @@ Usage:
 API commands (thin clients; defaults from weft.yaml network.listen + security.admin_api_key):
   weft jobs list [--status S] [--priority P] [--limit N]
   weft jobs get <id>
-  weft jobs create <input_ref> --profile <name> [--priority P] [--destination N]
+  weft jobs create <input_ref> --profile <name> [--priority P] [--destination N] [--source-server N]
+                   [--trim-start S] [--trim-end S] [--thumb-count N|--thumb-at S] [--thumb-size WxH|original]
+                   [--forced] [--default] (profiles incl. trim-update, poster-replace — see 'weft profiles')
   weft jobs events <id>
   weft jobs action <id> <cancel|retry|pause|resume>
+  weft jobs priority <id> <emergency|high|normal|low|background>
   weft keys create <name> <scope...> | keys list | keys delete <id>
-  weft webhooks create <url> <event...> [--secret S] | webhooks list | webhooks delete <id>
+  weft webhooks create <url> <event...> [--secret S] | webhooks list | webhooks delete <id> | webhooks replay <event_id>
   weft storage list | storage add <id> <type> [--host H] [--user U]
-  weft queue | workers | profiles | plugins | metrics | benchmark | system
+  weft queue | workers | profiles | plugins | metrics | benchmark [get|show] | system
+  weft config export [--out F] [--include-secrets] | config import <file>
+  weft cron list | cron run <cleanup|benchmark|health_scan>
+  weft dashboard [--interval 2s]   live view: jobs/queue/workers/system, select+cancel/pause/resume/delete
   (all accept --api <url> and --key <token>)
 `, core.Version)
 }
@@ -131,7 +143,7 @@ func cmdServe(args []string) error {
 		return fmt.Errorf("invalid configuration")
 	}
 
-	d, err := daemon.Open(c, nil)
+	d, err := daemon.Open(c, nil, daemon.Options{ConfigPath: *configPath})
 	if err != nil {
 		return err
 	}

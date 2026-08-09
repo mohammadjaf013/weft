@@ -18,11 +18,14 @@ type testPlugin struct {
 	kinds []string
 	err   error
 	delay time.Duration
+	// cpu is this plugin's declared EstimatedCPU cost (0 by default, i.e. no
+	// budget impact — most tests don't care).
+	cpu float64
 }
 
 func (p *testPlugin) Name() string { return p.name }
 func (p *testPlugin) Capabilities() core.Capabilities {
-	return core.Capabilities{Name: p.name, SupportedKinds: p.kinds}
+	return core.Capabilities{Name: p.name, SupportedKinds: p.kinds, EstimatedCPU: p.cpu}
 }
 func (p *testPlugin) Process(ctx context.Context, in core.TaskInput) (core.TaskOutput, error) {
 	if p.delay > 0 {
@@ -293,7 +296,7 @@ func TestWorkerSetsInputURIFromResolver(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	e.cancel = cancel
 	opts := e.worker.opts
-	opts.InputResolver = func(job core.Job) (string, error) {
+	opts.InputResolver = func(ctx context.Context, job core.Job) (string, error) {
 		gotURI = "/resolved/" + string(job.ID)
 		return gotURI, nil
 	}
@@ -357,6 +360,77 @@ func TestWorkerGateBlocksScheduling(t *testing.T) {
 	// open the gate; the task should now be processed
 	e.worker.opts.Gate = func() bool { return true }
 	waitStatus(t, e, "jg", core.JobCompleted)
+}
+
+// TestWorkerBudgetDefersSecondTask verifies a shared Budget serializes two
+// independent jobs' tasks whose combined declared cost exceeds the ceiling —
+// two workers, two unrelated jobs (no DAG dependency links them), one budget
+// slot. Without Budget wired in, both would start immediately since nothing
+// else limits cross-job concurrency beyond the worker pool size.
+func TestWorkerBudgetDefersSecondTask(t *testing.T) {
+	store, err := sqlite.OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bus := core.NewEventBus()
+	sm := core.NewStateMachine(store, bus)
+	sched := core.NewDAGScheduler(store, bus, sm)
+	reg := registry.New()
+	if err := reg.Register(&testPlugin{name: "v", kinds: []string{"video_encode"}, delay: 250 * time.Millisecond, cpu: 1}); err != nil {
+		t.Fatal(err)
+	}
+	budget := NewBudget(1, 0) // room for exactly one cpu=1 task at a time
+
+	ctx, cancel := context.WithCancel(context.Background())
+	opts := Options{
+		Store: store, Bus: bus, Sched: sched, SM: sm, Registry: reg,
+		Executor: fakeExec{}, LeaseTTL: time.Minute, Interval: 10 * time.Millisecond,
+		Budget: budget,
+	}
+	w1 := New("w1", opts)
+	w2 := New("w2", opts)
+	t.Cleanup(func() {
+		cancel()
+		bus.Close()
+		store.Close()
+	})
+
+	for _, id := range []string{"j1", "j2"} {
+		job := core.Job{ID: core.JobID(id), Status: core.JobQueued, Priority: core.PriorityNormal, Profile: "test"}
+		if err := store.SaveJob(ctx, job); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.SaveTask(ctx, core.Task{ID: core.TaskID(id + "-t"), JobID: core.JobID(id), Kind: "video_encode", Status: core.TaskPending}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	go w1.Run(ctx)
+	go w2.Run(ctx)
+
+	e := &env{store: store}
+	// at least one job must be running quickly...
+	waitStatus(t, e, "j1", core.JobRunning, core.JobCompleted)
+
+	// ...but partway through the first task's 250ms delay, the SECOND job
+	// must still be waiting — proving the budget, not luck, is why they
+	// didn't both start at once.
+	time.Sleep(120 * time.Millisecond)
+	j1, _ := store.LoadJob(ctx, "j1")
+	j2, _ := store.LoadJob(ctx, "j2")
+	running := 0
+	for _, j := range []core.Job{j1, j2} {
+		if j.Status == core.JobRunning {
+			running++
+		}
+	}
+	if running != 1 {
+		t.Fatalf("expected exactly 1 job running under a 1-slot budget, got %d (j1=%s j2=%s)", running, j1.Status, j2.Status)
+	}
+
+	// both eventually complete once the budget frees up between them.
+	waitStatus(t, e, "j1", core.JobCompleted)
+	waitStatus(t, e, "j2", core.JobCompleted)
 }
 
 // pauseRecorder is a fake executor that also implements core.ProcessController
@@ -469,6 +543,55 @@ func TestWorkerPauseResumeSignals(t *testing.T) {
 		case <-deadline:
 			t.Fatal("executor.Resume was never called during job resume")
 		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
+// TestWorkerResumedJobReachesCompleted is the regression test for the
+// JobResumed dead-end: before the fix, allowedTransitions had no entry for
+// JobResumed and reserve()'s status switch had no case for it, so a job that
+// was paused and resumed could never transition again — it stuck at
+// "resumed" forever instead of reaching uploading/completed. Uses a two-task
+// job (video_encode -> upload) so both the scheduler's finishJob (routing
+// JobResumed through JobUploading) and the worker's reserve() (detecting the
+// upload-phase task while the job is JobResumed) are exercised.
+func TestWorkerResumedJobReachesCompleted(t *testing.T) {
+	e := newWorkerEnv(t,
+		&testPlugin{name: "v", kinds: []string{"video_encode"}, delay: 150 * time.Millisecond},
+		&testPlugin{name: "u", kinds: []string{"upload"}},
+	)
+	ctx := context.Background()
+
+	job := core.Job{ID: "jr", Status: core.JobQueued, Priority: core.PriorityNormal, Profile: "test"}
+	if err := e.store.SaveJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	e.store.SaveTask(ctx, core.Task{ID: "vr", JobID: "jr", Kind: "video_encode", Status: core.TaskPending})
+	e.store.SaveTask(ctx, core.Task{ID: "ur", JobID: "jr", Kind: "upload", Status: core.TaskPending, DependsOn: []core.TaskID{"vr"}})
+
+	go e.worker.Run(e.ctx)
+	waitStatus(t, e, "jr", core.JobRunning)
+
+	sm := e.worker.opts.SM
+	if err := sm.Transition(ctx, "jr", core.JobPaused, "test"); err != nil {
+		t.Fatal(err)
+	}
+	waitStatus(t, e, "jr", core.JobPaused)
+	if err := sm.Transition(ctx, "jr", core.JobResumed, "test"); err != nil {
+		t.Fatal(err)
+	}
+	waitStatus(t, e, "jr", core.JobResumed)
+
+	// Before the fix this timed out: the job stayed at "resumed" forever.
+	waitStatus(t, e, "jr", core.JobCompleted)
+
+	for _, id := range []core.TaskID{"vr", "ur"} {
+		tk, err := e.store.LoadTask(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tk.Status != core.TaskDone {
+			t.Fatalf("task %s status = %s, want done", id, tk.Status)
 		}
 	}
 }

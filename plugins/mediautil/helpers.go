@@ -3,6 +3,7 @@ package mediautil
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -130,19 +131,44 @@ func ParamFloat(params map[string]any, name string, def float64) float64 {
 	return def
 }
 
+// ParamBool reads a bool param by name, returning def when absent or
+// unparsable. Task params round-trip through JSON (decoded into map[string]any
+// as a real bool), so this is mostly a defensive default rather than a
+// multi-type coercion like ParamFloat.
+func ParamBool(params map[string]any, name string, def bool) bool {
+	v, ok := params[name]
+	if !ok {
+		return def
+	}
+	if b, ok := v.(bool); ok {
+		return b
+	}
+	return def
+}
+
 // TrimFromParams derives a Trim from "trim_start"/"trim_end" task params.
 // trim_start skips that many seconds from the beginning; trim_end keeps the
 // clip but cuts that many seconds off the end (requires the probed duration).
-// Returns zero Trim when neither param is set.
-func TrimFromParams(params map[string]any, duration float64) Trim {
+// Returns zero Trim when neither param is set. Returns an error — instead of
+// silently producing an untrimmed (or empty) clip — when trim_end is
+// requested but the source duration couldn't be probed, or when the
+// requested window leaves nothing to encode; the caller must fail the task
+// rather than proceed as if trimming had succeeded.
+func TrimFromParams(params map[string]any, duration float64) (Trim, error) {
 	start := ParamFloat(params, "trim_start", 0)
 	end := ParamFloat(params, "trim_end", 0)
 	if start <= 0 && end <= 0 {
-		return Trim{}
+		return Trim{}, nil
+	}
+	if end > 0 && duration <= 0 {
+		return Trim{}, fmt.Errorf("trim_end=%.2f requested but the source duration could not be probed", end)
 	}
 	keep := duration - start - end
-	if keep <= 0 {
-		return Trim{Start: start, Keep: 0}
+	if end > 0 && keep <= 0 {
+		return Trim{}, fmt.Errorf("trim_start=%.2f trim_end=%.2f leaves no content in a %.2fs source", start, end, duration)
 	}
-	return Trim{Start: start, Keep: keep}
+	if keep < 0 {
+		keep = 0
+	}
+	return Trim{Start: start, Keep: keep}, nil
 }

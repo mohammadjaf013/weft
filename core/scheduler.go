@@ -54,7 +54,10 @@ func (s *dagScheduler) Submit(ctx context.Context, job Job, tasks []Task) error 
 // runnable. Ready tasks that are still ready on a later poll are returned again
 // so a crash between "ready" and "reserve" recovers automatically.
 func (s *dagScheduler) NextReady(ctx context.Context) (*Task, error) {
-	jobs, err := s.store.ListJobs(ctx, JobFilter{})
+	// ListActiveJobs (not ListJobs(ctx, JobFilter{})) so this poll — run every
+	// ~500ms per worker — doesn't re-scan the entire job history, including
+	// every job that's already completed/cancelled/failed, on every tick.
+	jobs, err := s.store.ListActiveJobs(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -68,20 +71,22 @@ func (s *dagScheduler) NextReady(ctx context.Context) (*Task, error) {
 	}
 	best := (*Task)(nil)
 	bestRank := 5
+	var bestCreatedAt time.Time
 	// map of taskID -> status for dependency lookup
 	byID := map[TaskID]Task{}
 	jobByID := map[JobID]Job{}
-	var allTasks []Task
+	jobIDs := make([]JobID, 0, len(jobs))
 	for _, j := range jobs {
 		jobByID[j.ID] = j
-		ts, err := s.store.ListTasks(ctx, j.ID)
-		if err != nil {
-			return nil, err
-		}
-		allTasks = append(allTasks, ts...)
-		for _, t := range ts {
-			byID[t.ID] = t
-		}
+		jobIDs = append(jobIDs, j.ID)
+	}
+	// one batched query instead of one ListTasks call per active job
+	allTasks, err := s.store.ListTasksForJobs(ctx, jobIDs)
+	if err != nil {
+		return nil, err
+	}
+	for _, t := range allTasks {
+		byID[t.ID] = t
 	}
 	for _, t := range allTasks {
 		job := jobByID[t.JobID]
@@ -97,10 +102,15 @@ func (s *dagScheduler) NextReady(ctx context.Context) (*Task, error) {
 			continue
 		}
 		rank := job.Priority.Rank()
-		if best == nil || rank < bestRank {
+		// same-priority ties are served oldest-job-first (FIFO within a
+		// priority band) instead of arbitrary map-iteration order.
+		better := best == nil || rank < bestRank ||
+			(rank == bestRank && job.CreatedAt.Before(bestCreatedAt))
+		if better {
 			tt := t
 			best = &tt
 			bestRank = rank
+			bestCreatedAt = job.CreatedAt
 		}
 	}
 	if best == nil {
@@ -189,7 +199,7 @@ func (s *dagScheduler) MarkDone(ctx context.Context, taskID TaskID) error {
 // uploading→completed is the only legal terminal step.
 func (s *dagScheduler) finishJob(ctx context.Context, job Job) error {
 	switch job.Status {
-	case JobQueued, JobReserved, JobRunning:
+	case JobQueued, JobReserved, JobRunning, JobResumed:
 		if err := s.sm.TransitionJob(ctx, job, JobUploading, ""); err != nil {
 			return err
 		}

@@ -59,12 +59,15 @@ func newTestEnv(t *testing.T) (*sqlite.Store, *Dispatcher, *fakeHTTP) {
 	return store, d, fh
 }
 
+// enqueueJobFinished persists a job.completed event for a webhook already
+// saved with a matching Events list. AppendEvent enqueues the matching outbox
+// row itself, in the same transaction as the event insert (see
+// runtime/store/sqlite's insertEventTx) — callers must NOT also call
+// Outbox().Enqueue for the same (event, webhook) pair, or delivery doubles.
 func enqueueJobFinished(t *testing.T, store *sqlite.Store, evID, whID string) {
 	t.Helper()
 	ctx := context.Background()
-	// persist the event row so the dispatcher can load it
-	store.AppendEvent(ctx, core.Event{ID: evID, JobID: "j1", Kind: core.EvtJobFinished, Payload: []byte(`{"status":"completed"}`), CreatedAt: core.Now()})
-	if err := store.Outbox().Enqueue(ctx, evID, whID, core.Now()); err != nil {
+	if err := store.AppendEvent(ctx, core.Event{ID: evID, JobID: "j1", Kind: core.EvtJobFinished, Payload: []byte(`{"status":"completed"}`), CreatedAt: core.Now()}); err != nil {
 		t.Fatal(err)
 	}
 }

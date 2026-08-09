@@ -2,6 +2,7 @@ package masterupdate
 
 import (
 	"context"
+	"io"
 	"strings"
 	"testing"
 
@@ -19,7 +20,7 @@ movie/1080p/movie.m3u8
 `
 
 func TestUpdatePlaylistAddsSubtitle(t *testing.T) {
-	out, err := updatePlaylist(baseMaster, "subtitle", "fa", "subtitle/fa/movie.vtt")
+	out, err := updatePlaylist(baseMaster, "subtitle", "fa", "subtitle/fa/movie.vtt", false, false)
 	if err != nil {
 		t.Fatalf("updatePlaylist: %v", err)
 	}
@@ -42,7 +43,7 @@ func TestUpdatePlaylistAddsSubtitle(t *testing.T) {
 func TestUpdatePlaylistReplacesSameLang(t *testing.T) {
 	master := baseMaster + `
 #EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="فارسی",DEFAULT=YES,AUTOSELECT=YES,FORCED=NO,LANGUAGE="fa",URI="subtitle/fa/movie.vtt"`
-	out, err := updatePlaylist(master, "subtitle", "fa", "subtitle/fa/movie.vtt")
+	out, err := updatePlaylist(master, "subtitle", "fa", "subtitle/fa/movie.vtt", false, false)
 	if err != nil {
 		t.Fatalf("updatePlaylist: %v", err)
 	}
@@ -52,11 +53,11 @@ func TestUpdatePlaylistReplacesSameLang(t *testing.T) {
 }
 
 func TestUpdatePlaylistAddsTwoLangs(t *testing.T) {
-	out, err := updatePlaylist(baseMaster, "subtitle", "fa", "subtitle/fa/movie.vtt")
+	out, err := updatePlaylist(baseMaster, "subtitle", "fa", "subtitle/fa/movie.vtt", false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err = updatePlaylist(out, "subtitle", "en", "subtitle/en/movie.vtt")
+	out, err = updatePlaylist(out, "subtitle", "en", "subtitle/en/movie.vtt", false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +72,7 @@ func TestUpdatePlaylistAddsTwoLangs(t *testing.T) {
 }
 
 func TestUpdatePlaylistAudioGroup(t *testing.T) {
-	out, err := updatePlaylist(baseMaster, "audio", "fa", "audio/fa/movie.m3u8")
+	out, err := updatePlaylist(baseMaster, "audio", "fa", "audio/fa/movie.m3u8", false, false)
 	if err != nil {
 		t.Fatalf("updatePlaylist: %v", err)
 	}
@@ -82,6 +83,66 @@ func TestUpdatePlaylistAudioGroup(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("playlist missing %q:\n%s", want, out)
 		}
+	}
+}
+
+// TestUpdatePlaylistForcedDefaultFlags is the regression test for D4: before
+// the fix, DEFAULT/FORCED were hardcoded to NO regardless of what the caller
+// requested.
+func TestUpdatePlaylistForcedDefaultFlags(t *testing.T) {
+	out, err := updatePlaylist(baseMaster, "subtitle", "fa", "subtitle/fa/movie.vtt", true, true)
+	if err != nil {
+		t.Fatalf("updatePlaylist: %v", err)
+	}
+	want := `#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="فارسی",DEFAULT=YES,AUTOSELECT=YES,FORCED=YES,LANGUAGE="fa",URI="subtitle/fa/movie.vtt"`
+	if !strings.Contains(out, want) {
+		t.Errorf("playlist missing %q:\n%s", want, out)
+	}
+
+	// default (unset) case must still be NO/NO.
+	outDefault, err := updatePlaylist(baseMaster, "subtitle", "fa", "subtitle/fa/movie.vtt", false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(outDefault, "DEFAULT=NO") || !strings.Contains(outDefault, "FORCED=NO") {
+		t.Errorf("unset forced/default must render NO/NO:\n%s", outDefault)
+	}
+}
+
+// TestProcessAppliesForcedDefaultParams verifies Process reads the
+// forced/default task params (as set by buildTasks from --forced/--default)
+// and threads them through to updatePlaylist.
+func TestProcessAppliesForcedDefaultParams(t *testing.T) {
+	mediautil.WorkRoot = t.TempDir()
+	dir := t.TempDir()
+	st, err := local.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := core.AssetRef{Kind: "playlist", Name: "playlist.m3u8"}
+	if err := st.Save(context.Background(), ref, strings.NewReader(baseMaster)); err != nil {
+		t.Fatalf("seed master: %v", err)
+	}
+	in := core.TaskInput{
+		TaskID:  "t2",
+		Kind:    "update_master",
+		Params:  map[string]any{"lang": "fa", "name": "movie", "track": "subtitle", "forced": true, "default": true},
+		Storage: st,
+	}
+	if _, err := (&Plugin{}).Process(context.Background(), in); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	rc, err := st.Open(context.Background(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	b, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "DEFAULT=YES") || !strings.Contains(string(b), "FORCED=YES") {
+		t.Errorf("stored master missing forced/default flags:\n%s", b)
 	}
 }
 
@@ -131,7 +192,7 @@ func TestProcessUpdatesStoredMaster(t *testing.T) {
 }
 
 func TestUpdatePlaylistUnknownKind(t *testing.T) {
-	if _, err := updatePlaylist(baseMaster, "bogus", "fa", "x"); err == nil {
+	if _, err := updatePlaylist(baseMaster, "bogus", "fa", "x", false, false); err == nil {
 		t.Fatal("expected error for unknown track kind")
 	}
 }

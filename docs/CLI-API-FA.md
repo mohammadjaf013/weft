@@ -301,6 +301,7 @@ curl -X POST http://127.0.0.1:8443/jobs \
 | `weft jobs asset <id> <name>` | `GET /jobs/{id}/assets/{name}` |
 | `weft jobs delete <id>` | `DELETE /jobs/{id}` |
 | `weft jobs action <id> cancel` | `POST /jobs/{id}/cancel` |
+| `weft jobs priority <id> <p>` | `PATCH /jobs/{id}/priority` |
 | `weft workers scale <count>` | `POST /workers/scale` |
 | `weft queue` | `GET /queue` |
 | `weft workers` | `GET /workers` |
@@ -310,15 +311,33 @@ curl -X POST http://127.0.0.1:8443/jobs \
 | `weft webhooks list` | `GET /webhooks` |
 | `weft webhooks create …` | `POST /webhooks` |
 | `weft webhooks delete <id>` | `DELETE /webhooks/{id}` |
+| `weft webhooks replay <event_id>` | `POST /webhooks/{event_id}/replay` |
 | `weft keys create …` | `POST /keys` |
 | `weft keys list` | `GET /keys` |
 | `weft keys delete <id>` | `DELETE /keys/{id}` |
 | `weft profiles` | `GET /profiles` |
 | `weft plugins` | `GET /plugins` |
 | `weft metrics` | `GET /metrics` |
-| `weft benchmark` | `POST /benchmark` |
+| `weft benchmark` / `benchmark get` | `POST /benchmark` / `GET /benchmark` |
+| `weft config export` / `config import <f>` | `GET /config/export` / `POST /config/import` |
+| `weft cron list` / `cron run <job>` | `GET /cron` / `POST /cron/{job}/run` |
+| `weft dashboard` | ترکیبی از `/jobs`, `/queue`, `/workers`, `/system`, `/jobs/{id}` + اکشن‌ها |
 
 فلگ‌های مشترک CLI: `--api <url>` و `--key <token>` و `--config <path>`.
+
+### `weft dashboard` — داشبورد زنده ترمینال
+
+نمای زنده‌ی job های فعال (running/queued/paused/resumed/uploading)، صف
+اولویت، worker ها، و منابع میزبان — با بازه‌ی رفرش قابل‌تنظیم
+(`--interval`، پیش‌فرض ۲ ثانیه). با کلیدهای جهت‌نما یک ردیف را انتخاب کنید؛
+سپس `c` لغو، `p` توقف موقت، `r` ازسرگیری، `x` حذف (با تأیید `y`)، `enter`
+رفرش فوری، `q` خروج. برای job انتخاب‌شده، جزئیات task ها + یک تخمین زمان
+باقی‌مانده (ETA) ساده هم نمایش داده می‌شود. تمام اکشن‌ها از همان endpoint های
+بالا عبور می‌کنند — پیاده‌سازی جداگانه‌ای ندارند.
+
+```
+weft dashboard --api http://127.0.0.1:8443 --key <token> --interval 2s
+```
 
 ### برش (trim) و تامبنیل سفارشی هنگام ساخت job
 
@@ -329,7 +348,10 @@ curl -X POST http://127.0.0.1:8443/jobs \
 | `--trim-start <s>` | N ثانیه از ابتدای کلیپ قبل از HLS حذف شود (مثلاً `50` یعنی از ثانیه ۵۰ شروع شود) |
 | `--trim-end <s>` | N ثانیه از انتهای کلیپ حذف شود (مثلاً `10` یعنی ۱۰ ثانیه آخر بریده شود) |
 | `--thumb-count <n>` | به جای پوستر/اسپرایت/استیلز پیش‌فرض، دقیقاً n تامبنیل هم‌فاصله ساخته و آپلود شود |
-| `--thumb-size <sz>` | اندازه تامبنیل: `1080x1080` یا `original` (فقط با `--thumb-count`) |
+| `--thumb-at <s>` | فقط یک فریم در همین لحظه (ثانیه) گرفته شود — جایگزین `--thumb-count`، با آن قابل‌ترکیب نیست |
+| `--thumb-size <sz>` | اندازه تامبنیل: `1080x1080` یا `original` (با `--thumb-count` یا `--thumb-at`) |
+| `--source-server <id>` | `input_ref` یک مسیر نسبی روی این storage server ثبت‌شده باشد (به‌جای مسیر لوکال) — یا `input_ref` می‌تواند مستقیماً یک URL با `http(s)://` باشد بدون این فلگ |
+| `--forced` / `--default` | برای `--profile subtitle-add`: فلگ‌های `FORCED=YES`/`DEFAULT=YES` روی ترک زیرنویس |
 
 مثال: از ثانیه ۵۰ تا ۱۰ ثانیه مانده به انتها، با ۵ تامبنیل 1080×1080:
 

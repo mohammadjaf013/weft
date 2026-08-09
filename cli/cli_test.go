@@ -109,7 +109,11 @@ func TestParseRemotePicksUpAdminKey(t *testing.T) {
 }
 
 func TestJobsCreateBodySrcLang(t *testing.T) {
-	body := jobsCreateBody("/mnt/in.mp4", "ai-subtitle", "high", 2, "fa", "tr", "movie", "series", true, "hybrid", 0, 0, 0, "")
+	body := jobsCreateBody(jobsCreateOpts{
+		InputRef: "/mnt/in.mp4", Profile: "ai-subtitle", Priority: "high", Dest: 2,
+		Lang: "fa", SrcLang: "tr", Name: "movie", Path: "series",
+		DeleteSource: true, Provider: "hybrid",
+	})
 	want := map[string]any{
 		"input_ref":      "/mnt/in.mp4",
 		"profile":        "ai-subtitle",
@@ -127,7 +131,7 @@ func TestJobsCreateBodySrcLang(t *testing.T) {
 	}
 
 	// empty optional flags must be omitted entirely
-	minimal := jobsCreateBody("in.mp4", "vod-h264", "normal", 0, "", "", "", "", false, "", 0, 0, 0, "")
+	minimal := jobsCreateBody(jobsCreateOpts{InputRef: "in.mp4", Profile: "vod-h264", Priority: "normal"})
 	if _, ok := minimal["src_lang"]; ok {
 		t.Errorf("empty src_lang must be omitted: %v", minimal)
 	}
@@ -139,11 +143,33 @@ func TestJobsCreateBodySrcLang(t *testing.T) {
 	}
 
 	// trim + custom thumbnail params
-	trimmed := jobsCreateBody("in.mp4", "vod-h264", "normal", 0, "", "", "", "", false, "", 50, 10, 5, "1080x1080")
+	trimmed := jobsCreateBody(jobsCreateOpts{
+		InputRef: "in.mp4", Profile: "vod-h264", Priority: "normal",
+		TrimStart: 50, TrimEnd: 10, ThumbCount: 5, ThumbSize: "1080x1080",
+	})
 	if trimmed["trim_start"] != float64(50) || trimmed["trim_end"] != float64(10) {
 		t.Errorf("trim params = %v", trimmed)
 	}
 	if trimmed["thumb_count"] != 5 || trimmed["thumb_size"] != "1080x1080" {
 		t.Errorf("thumb params = %v", trimmed)
+	}
+
+	// single-timestamp thumbnail, source server, and subtitle track flags
+	extra := jobsCreateBody(jobsCreateOpts{
+		InputRef: "in.mp4", Profile: "subtitle-add", Priority: "normal",
+		ThumbAt: 83, ThumbSize: "original", SourceServer: 5,
+		Forced: true, DefaultTrack: true,
+	})
+	if extra["thumb_at"] != float64(83) || extra["thumb_size"] != "original" {
+		t.Errorf("thumb_at params = %v", extra)
+	}
+	if extra["source_server_id"] != 5 {
+		t.Errorf("source_server_id = %v, want 5", extra["source_server_id"])
+	}
+	if extra["forced"] != true || extra["default"] != true {
+		t.Errorf("forced/default = %v", extra)
+	}
+	if _, ok := extra["thumb_count"]; ok {
+		t.Errorf("thumb_count must be omitted when only thumb_at is set: %v", extra)
 	}
 }

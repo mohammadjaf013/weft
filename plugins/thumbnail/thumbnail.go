@@ -38,13 +38,22 @@ func (p *Plugin) Process(ctx context.Context, in core.TaskInput) (core.TaskOutpu
 
 	// Optional coordinated trim: when the HLS pipeline trimmed the clip, the
 	// thumbnails must come from the same window so they match the renditions.
-	trim := mediautil.TrimFromParams(in.Params, mediautil.Duration(in))
+	trim, err := mediautil.TrimFromParams(in.Params, mediautil.Duration(in))
+	if err != nil {
+		return core.TaskOutput{}, fmt.Errorf("thumbnail: %w", err)
+	}
 
 	// Custom mode: when thumb_count is set, produce exactly that many
 	// evenly-spaced thumbnails at thumb_size ("1080x1080" or "original")
 	// instead of the default poster/sprite/stills set.
 	if count, _ := in.Params["thumb_count"].(float64); count > 0 {
 		return p.stillThumbs(ctx, in, outDir, base, trim, int(count))
+	}
+	// Single-timestamp mode: when thumb_at is set, capture exactly one frame
+	// at that offset ("grab the thumbnail at 00:01:23") instead of the
+	// default set or the N-evenly-spaced thumb_count mode.
+	if at, _ := in.Params["thumb_at"].(float64); at > 0 {
+		return p.singleThumb(ctx, in, outDir, base, at)
 	}
 
 	poster := fmt.Sprintf("%s/%s_poster.jpg", outDir, base)
@@ -162,6 +171,29 @@ func (p *Plugin) stillThumbs(ctx context.Context, in core.TaskInput, outDir, bas
 		assets = append(assets, core.AssetRef{Kind: "thumbnail", Name: filepath.Base(f), URI: "local:" + f, Dir: "thumbnails"})
 	}
 	return core.TaskOutput{Assets: assets}, nil
+}
+
+// singleThumb captures exactly one frame at the given offset (seconds) — the
+// "grab the thumbnail at 00:01:23" case, distinct from stillThumbs' N
+// evenly-spaced frames. Seeks against the ORIGINAL source timeline (ignores
+// any coordinated trim window) since the caller gave an explicit absolute
+// timestamp, not a trim-relative one.
+func (p *Plugin) singleThumb(ctx context.Context, in core.TaskInput, outDir, base string, at float64) (core.TaskOutput, error) {
+	dest := fmt.Sprintf("%s/%s_thumb_at.jpg", outDir, base)
+	args := []string{"-ss", fmt.Sprintf("%.3f", at), "-i", in.InputURI, "-frames:v", "1"}
+	if sz, _ := in.Params["thumb_size"].(string); sz != "" && sz != "original" {
+		if w, h := parseSize(sz); w > 0 && h > 0 {
+			args = append(args, "-vf", fmt.Sprintf("scale=%d:%d", w, h))
+		}
+	}
+	args = append(args, dest)
+	in.Params["argv"] = args
+	if _, err := in.Executor.Run(ctx, core.Task{}, in); err != nil {
+		return core.TaskOutput{}, err
+	}
+	return core.TaskOutput{Assets: []core.AssetRef{
+		{Kind: "thumbnail", Name: base + "_thumb_at.jpg", URI: "local:" + dest, Dir: "thumbnails"},
+	}}, nil
 }
 
 // trimInsert splices the input seek and output duration options into an argv

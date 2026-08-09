@@ -32,6 +32,7 @@ var allowedTransitions = map[JobStatus]map[JobStatus]bool{
 	JobRunning:    {JobUploading: true, JobFailed: true, JobTimeout: true, JobCancelled: true, JobRetry: true, JobPaused: true},
 	JobUploading:  {JobCompleted: true, JobFailed: true, JobTimeout: true, JobCancelled: true, JobRetry: true},
 	JobPaused:     {JobResumed: true, JobCancelled: true, JobTimeout: true, JobFailed: true},
+	JobResumed:    {JobUploading: true, JobFailed: true, JobTimeout: true, JobCancelled: true, JobRetry: true, JobPaused: true},
 	JobRetry:      {JobQueued: true, JobDeadLetter: true},
 	JobFailed:     {JobRetry: true},
 	JobTimeout:    {JobRetry: true, JobDeadLetter: true},

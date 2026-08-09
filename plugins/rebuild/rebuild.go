@@ -131,6 +131,13 @@ func Render(rends []string, subs, auds []Track, codec string) string {
 	return b.String()
 }
 
+// mediaLine hardcodes DEFAULT=NO/FORCED=NO — known limitation, not a bug to
+// fix here: rebuild reconstructs the master by scanning storage for files
+// that already exist (Track carries only what a directory listing can infer:
+// lang/URI), with no durable per-track metadata store to recover a
+// previously-requested forced/default flag from. masterupdate.go (the
+// subtitle-add/dub-add path, which DOES have real request params at the
+// moment a track is added) is where forced/default are actually honored.
 func mediaLine(typ, group string, t Track) string {
 	line := fmt.Sprintf(
 		`#EXT-X-MEDIA:TYPE=%s,GROUP-ID="%s",NAME="%s",DEFAULT=NO,AUTOSELECT=YES,FORCED=NO,LANGUAGE="%s",URI="%s"`,

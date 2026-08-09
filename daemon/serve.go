@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -33,15 +35,9 @@ func (d *Daemon) Serve(ctx context.Context) error {
 		return err
 	}
 
-	// outbox enqueuer: bus event -> outbox rows for matching webhooks
-	enq := &outboxEnqueuer{store: d.store, bus: d.bus, interval: 300 * time.Millisecond}
-	d.wg.Add(1)
-	go func() {
-		defer d.wg.Done()
-		if err := enq.Run(ctx); err != nil {
-			log.Printf("outbox enqueuer stopped: %v", err)
-		}
-	}()
+	// Outbox rows are enqueued synchronously, in the same DB transaction as the
+	// triggering state change (runtime/store/sqlite's insertEventTx) — no
+	// separate bus-driven enqueuer goroutine needed here anymore.
 
 	// webhook dispatcher: poll outbox, deliver with retry/backoff
 	d.wh = webhook.NewDispatcher(webhook.Options{Store: d.store, Interval: 500 * time.Millisecond})
@@ -81,18 +77,35 @@ func (d *Daemon) Serve(ctx context.Context) error {
 		}()
 	}
 
+	// job retention: periodically delete terminal-status jobs (and their
+	// tasks/events/outputs/logs) older than the configured retention window,
+	// so job history — and the per-poll scan in NextReady/GET /queue — never
+	// grows without bound. cron.cleanup.retention_hours; 0 disables.
+	if hrs := d.cfg.Cron.Cleanup.RetentionHours; hrs > 0 {
+		d.wg.Add(1)
+		go func() {
+			defer d.wg.Done()
+			jobRetentionPruner(ctx, d.store, hrs, time.Hour)
+		}()
+	}
+
+	// cron: cleanup/benchmark/health_scan on their configured schedules, each
+	// also triggerable on demand (GET /cron, POST /cron/{job}/run, weft cron
+	// list/run). The scheduler itself only checks for due jobs every tick —
+	// a minute is plenty of resolution for schedules measured in minutes/hours.
+	if d.cronSched != nil {
+		d.wg.Add(1)
+		go func() {
+			defer d.wg.Done()
+			d.cronSched.Run(ctx, time.Minute)
+		}()
+	}
+
 	// workers. A resource gate idles workers when the host exceeds the
 	// scheduler thresholds, so the queue stays put instead of saturating CPU.
 	// workers.max caps how many tasks run at once (spawn that many workers);
-	// when unset, workers.min is the steady-state pool size.
-	min := d.cfg.Workers.Min
-	if min <= 0 {
-		min = 1
-	}
-	count := min
-	if d.cfg.Workers.Max > 0 && d.cfg.Workers.Max >= min {
-		count = d.cfg.Workers.Max
-	}
+	// workers.max: 0 means "auto" — see resolveWorkerCount.
+	count := resolveWorkerCount(d.cfg.Workers.Min, d.cfg.Workers.Max, runtime.NumCPU())
 	leaseTTL := 5 * time.Minute
 	if d.cfg.Workers.LeaseTTLSeconds > 0 {
 		leaseTTL = time.Duration(d.cfg.Workers.LeaseTTLSeconds) * time.Second
@@ -108,6 +121,10 @@ func (d *Daemon) Serve(ctx context.Context) error {
 	if gate != nil {
 		gateAllow = gate.Allow
 	}
+	var budget *worker.Budget
+	if d.cfg.Scheduler.MaxEstimatedCPUCores > 0 || d.cfg.Scheduler.MaxEstimatedRAMMB > 0 {
+		budget = worker.NewBudget(d.cfg.Scheduler.MaxEstimatedCPUCores, d.cfg.Scheduler.MaxEstimatedRAMMB)
+	}
 	// the pool owns the worker goroutines so it can be scaled at runtime
 	d.pool.setOptions(worker.Options{
 		Store:         d.store,
@@ -121,6 +138,7 @@ func (d *Daemon) Serve(ctx context.Context) error {
 		LeaseTTL:      leaseTTL,
 		InputResolver: d.resolveInputOr,
 		Gate:          gateAllow,
+		Budget:        budget,
 	})
 	if err := d.pool.Scale(ctx, count); err != nil {
 		return err
@@ -177,6 +195,27 @@ func (d *Daemon) Serve(ctx context.Context) error {
 	return nil
 }
 
+// resolveWorkerCount computes the worker pool's steady-state size.
+// workers.max > 0 is an explicit cap (used as-is, so long as it's >= min).
+// workers.max == 0 ("auto") means one worker per logical CPU core — bounded
+// below by workers.min — so a bigger box actually gets a bigger default pool
+// instead of the previous behavior, where "auto" silently meant "use
+// workers.min" (1, by default) regardless of host size. numCPU is a
+// parameter (not read via runtime.NumCPU() internally) so this is testable
+// without depending on the test machine's actual core count.
+func resolveWorkerCount(min, max, numCPU int) int {
+	if min <= 0 {
+		min = 1
+	}
+	switch {
+	case max > 0 && max >= min:
+		return max
+	case max == 0 && numCPU > min:
+		return numCPU
+	}
+	return min
+}
+
 // Stop cancels Serve.
 func (d *Daemon) Stop() {
 	if d.cancel != nil {
@@ -220,25 +259,39 @@ func (d *Daemon) refreshWorkerGauges() {
 }
 
 // resolveInputOr returns the injected InputResolver when set, else the default.
-func (d *Daemon) resolveInputOr(job core.Job) (string, error) {
+func (d *Daemon) resolveInputOr(ctx context.Context, job core.Job) (string, error) {
 	if d.inputResolver != nil {
-		return d.inputResolver(job)
+		return d.inputResolver(ctx, job)
 	}
-	return d.resolveInput(job)
+	return d.resolveInput(ctx, job)
 }
 
 // resolveInput turns a job's InputRef into a local path ffmpeg can read.
-// Supported refs: "local:/abs/path", "/abs/path", "C:\..." (Windows). Remote
-// schemes (s3://, ssh://, http://) are not fetched in this phase — they error
-// loudly so the job fails fast instead of silently producing nothing.
-func (d *Daemon) resolveInput(job core.Job) (string, error) {
+// Three cases:
+//   - job.SourceServerID != 0: InputRef is a relative path fetched from that
+//     REGISTERED storage server (the same servers already used for job
+//     output, weft storage add) into a local cache file — works uniformly
+//     across local/ssh/s3 since it only depends on core.Storage.Open.
+//   - InputRef starts with http:// or https://: fetched directly via one
+//     HTTP GET into the same local cache.
+//   - otherwise: "local:/abs/path", "/abs/path", "C:\..." (Windows) resolved
+//     directly, no fetch, exactly as before. A bare s3://ssh:// InputRef
+//     without a source_server_id still errors loudly — there is no
+//     credential to fetch it with.
+func (d *Daemon) resolveInput(ctx context.Context, job core.Job) (string, error) {
 	ref := strings.TrimSpace(job.InputRef)
 	if ref == "" {
 		return "", fmt.Errorf("job %s has empty input_ref", job.ID)
 	}
-	for _, scheme := range []string{"s3://", "ssh://", "http://", "https://"} {
+	if job.SourceServerID != 0 {
+		return d.fetchFromSourceServer(ctx, job, ref)
+	}
+	if strings.HasPrefix(ref, "http://") || strings.HasPrefix(ref, "https://") {
+		return d.fetchHTTP(ctx, job, ref)
+	}
+	for _, scheme := range []string{"s3://", "ssh://"} {
 		if strings.HasPrefix(ref, scheme) {
-			return "", fmt.Errorf("input_ref %q: fetching remote inputs is not supported yet", ref)
+			return "", fmt.Errorf("input_ref %q: remote sources need source_server_id set to a registered storage server (weft storage add)", ref)
 		}
 	}
 	ref = strings.TrimPrefix(ref, "local:")
@@ -251,6 +304,66 @@ func (d *Daemon) resolveInput(job core.Job) (string, error) {
 		return "", fmt.Errorf("input_ref %q is a directory, want a file", job.InputRef)
 	}
 	return ref, nil
+}
+
+// fetchFromSourceServer streams job.InputRef (a relative path, e.g.
+// "movies/foo.mp4") from the registered storage server job.SourceServerID
+// into a local cache file, returning the cache path.
+func (d *Daemon) fetchFromSourceServer(ctx context.Context, job core.Job, relPath string) (string, error) {
+	st, err := d.storageForID(ctx, job.SourceServerID, "")
+	if err != nil {
+		return "", fmt.Errorf("source_server_id %d: %w", job.SourceServerID, err)
+	}
+	rc, err := st.Open(ctx, core.AssetRef{Name: relPath})
+	if err != nil {
+		return "", fmt.Errorf("fetch source %q from server %d: %w", relPath, job.SourceServerID, err)
+	}
+	defer rc.Close()
+	return d.cacheToLocal(job, relPath, rc)
+}
+
+// fetchHTTP downloads a directly-reachable http(s):// InputRef into a local
+// cache file.
+func (d *Daemon) fetchHTTP(ctx context.Context, job core.Job, url string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("fetch %q: %w", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return "", fmt.Errorf("fetch %q: http %d", url, resp.StatusCode)
+	}
+	name := path.Base(strings.TrimRight(url, "/"))
+	if name == "" || name == "." || name == "/" {
+		name = string(job.ID)
+	}
+	return d.cacheToLocal(job, name, resp.Body)
+}
+
+// cacheToLocal writes r to a per-job scratch cache dir under
+// mediautil.WorkRoot, naming the file after the source's base name. Removed
+// by the cleaner once the job finishes (daemon/cleanup.go), same as the
+// per-task work dirs.
+func (d *Daemon) cacheToLocal(job core.Job, name string, r io.Reader) (string, error) {
+	dir := filepath.Join(mediautil.WorkRoot, "cache", string(job.ID))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	dest := filepath.Join(dir, filepath.Base(name))
+	f, err := os.Create(dest)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	if _, err := io.Copy(f, r); err != nil {
+		os.Remove(dest)
+		return "", fmt.Errorf("cache %q: %w", dest, err)
+	}
+	return dest, nil
 }
 
 // storageFor resolves the destination storage for a job from its DestinationID.
@@ -284,62 +397,6 @@ func (d *Daemon) storageForID(ctx context.Context, destinationID int, destPath s
 		return buildStorage(sv.Type, sv, destPath)
 	}
 	return nil, fmt.Errorf("destination_id %d not registered", destinationID)
-}
-
-// outboxEnqueuer subscribes to the bus and enqueues an outbox row for every
-// configured webhook whose Events list matches the event's wire name.
-type outboxEnqueuer struct {
-	store    *sqlite.Store
-	bus      core.EventBus
-	interval time.Duration
-}
-
-func (o *outboxEnqueuer) Run(ctx context.Context) error {
-	sub := o.bus.SubscribeAll()
-	tick := time.NewTicker(o.interval)
-	defer tick.Stop()
-	// drain periodically too in case a webhook was added after events fired
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case e, ok := <-sub:
-			if !ok {
-				return nil
-			}
-			if err := o.enqueueFor(ctx, e); err != nil {
-				return err
-			}
-		case <-tick.C:
-			// nothing; bus events drive enqueueing
-		}
-	}
-}
-
-func (o *outboxEnqueuer) enqueueFor(ctx context.Context, e core.Event) error {
-	whs, err := o.store.ListWebhooks(ctx)
-	if err != nil {
-		return err
-	}
-	wire := webhook.WireName(e.Kind)
-	for _, wh := range whs {
-		if !matches(wh.Events, wire) {
-			continue
-		}
-		if err := o.store.Outbox().Enqueue(ctx, e.ID, wh.ID, core.Now()); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func matches(list []string, wire string) bool {
-	for _, s := range list {
-		if s == wire || s == "*" {
-			return true
-		}
-	}
-	return false
 }
 
 // expirer periodically requeues tasks with expired leases so a dead worker's
@@ -383,6 +440,31 @@ func retentionPruner(ctx context.Context, store *sqlite.Store, retentionDays int
 			}
 			if n > 0 {
 				log.Printf("event retention pruned %d events older than %d days", n, retentionDays)
+			}
+		}
+	}
+}
+
+// jobRetentionPruner periodically deletes terminal-status jobs (and their
+// tasks/events/outputs/logs) older than retentionHours so job history never
+// grows without bound. Best effort: a failed prune is logged and retried next
+// tick.
+func jobRetentionPruner(ctx context.Context, store *sqlite.Store, retentionHours int, interval time.Duration) {
+	tick := time.NewTicker(interval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			cutoff := core.Now().Add(-time.Duration(retentionHours) * time.Hour)
+			n, err := store.PruneJobs(ctx, cutoff)
+			if err != nil {
+				log.Printf("job retention: %v", err)
+				continue
+			}
+			if n > 0 {
+				log.Printf("job retention pruned %d jobs older than %dh", n, retentionHours)
 			}
 		}
 	}

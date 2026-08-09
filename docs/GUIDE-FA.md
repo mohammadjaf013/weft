@@ -177,8 +177,19 @@ data/job_xxxx/film_preview.vtt      ← فهرست زمانی thumbnail ها
 .\weft.exe workers        # وضعیت worker ها (busy/idle + task جاری)
 .\weft.exe plugins        # پلاگین‌های فعال و انواع task ها
 .\weft.exe metrics        # متریک‌های Prometheus
-.\weft.exe benchmark      # اجرای بنچمارک CPU/ffmpeg
+.\weft.exe benchmark      # اجرای بنچمارک CPU/ffmpeg (یا benchmark get برای آخرین نتیجه)
 ```
+
+برای یک نمای زنده و تعاملی (به‌جای این دستورهای تکی)، از داشبورد استفاده کن:
+
+```powershell
+.\weft.exe dashboard --interval 2s
+```
+
+جدول job های فعال + صف + worker ها + منابع میزبان را هر ۲ ثانیه رفرش می‌کند؛
+با کلیدهای جهت‌نما یک ردیف را انتخاب کن، بعد `c` (لغو) / `p` (توقف موقت) /
+`r` (ازسرگیری) / `x` (حذف، با تأیید) / `q` (خروج). جزئیات کامل CLI/API:
+[CLI-API-FA.md](CLI-API-FA.md) و [REFERENCE.md](REFERENCE.md).
 
 ---
 
@@ -187,6 +198,10 @@ data/job_xxxx/film_preview.vtt      ← فهرست زمانی thumbnail ها
 ```powershell
 .\weft.exe doctor          # چک‌اپ کامل (خروجی 0=سالم، غیرصفر=مشکل)
 .\weft.exe version         # نسخه
+.\weft.exe config export -o backup.yaml   # پشتیبان‌گیری از پیکربندی در حال اجرا
+.\weft.exe config import backup.yaml      # بازگردانی (نیاز به ری‌استارت سرویس)
+.\weft.exe cron list                      # وضعیت job های cleanup/benchmark/health_scan
+.\weft.exe cron run cleanup               # اجرای فوری یکی از آن‌ها
 ```
 
 ---

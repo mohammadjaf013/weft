@@ -23,15 +23,15 @@ func TestRealMasterMultipleSubs(t *testing.T) {
 
 	var err error
 	out := real
-	out, err = updatePlaylist(out, "subtitle", "fa", "subtitle/fa/movie.vtt")
+	out, err = updatePlaylist(out, "subtitle", "fa", "subtitle/fa/movie.vtt", false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err = updatePlaylist(out, "subtitle", "en", "subtitle/en/movie.vtt")
+	out, err = updatePlaylist(out, "subtitle", "en", "subtitle/en/movie.vtt", false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err = updatePlaylist(out, "subtitle", "tr", "subtitle/tr/movie.vtt")
+	out, err = updatePlaylist(out, "subtitle", "tr", "subtitle/tr/movie.vtt", false, false)
 	if err != nil {
 		t.Fatal(err)
 	}

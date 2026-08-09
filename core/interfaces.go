@@ -76,9 +76,17 @@ type Store interface {
 	SaveJob(ctx context.Context, j Job) error
 	LoadJob(ctx context.Context, id JobID) (Job, error)
 	ListJobs(ctx context.Context, filter JobFilter) ([]Job, error)
+	// ListActiveJobs returns every job not yet in a terminal status (completed,
+	// cancelled, failed, timeout, dead_letter). Used by the scheduler's poll
+	// loop instead of ListJobs(ctx, JobFilter{}) so it doesn't re-scan the
+	// entire job history (including years of completed jobs) every ~500ms.
+	ListActiveJobs(ctx context.Context) ([]Job, error)
 	SaveTask(ctx context.Context, t Task) error
 	LoadTask(ctx context.Context, id TaskID) (Task, error)
 	ListTasks(ctx context.Context, jobID JobID) ([]Task, error)
+	// ListTasksForJobs batch-loads tasks for several jobs in one query, so the
+	// scheduler's poll loop avoids an N+1 (one ListTasks call per active job).
+	ListTasksForJobs(ctx context.Context, jobIDs []JobID) ([]Task, error)
 	// UpdateTaskProgress writes only the progress/status fields of a task,
 	// leaving lease, started_at, finished_at and error untouched. Used by the
 	// worker's progress callback so frequent progress updates never clobber

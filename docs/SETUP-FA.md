@@ -298,6 +298,8 @@ cat /opt/weft/data/Series-Test/movie1/movie_master.m3u8
 .\weft.exe jobs action <job-id> retry
 .\weft.exe jobs action <job-id> pause
 .\weft.exe jobs action <job-id> resume
+.\weft.exe jobs priority <job-id> emergency   # تغییر اولویت تا وقتی هنوز صف است
+.\weft.exe jobs delete <job-id>               # حذف کامل (فقط برای job های تمام‌شده)
 ```
 
 ### پروفایل‌ها
@@ -311,6 +313,8 @@ cat /opt/weft/data/Series-Test/movie1/movie_master.m3u8
 | `ai-subtitle` | ویدیو/صوتی | زیرنویس تولیدشده با AI + آپلود |
 | `subtitle-add` | فایل SRT/VTT | افزودن/جایگزینی زیرنویس به ویدیوی قبلاً-منتشرشده + به‌روزرسانی master |
 | `dub-add` | فایل صوتی | افزودن/جایگزینی دوبله به ویدیوی قبلاً-منتشرشده + به‌روزرسانی master |
+| `trim-update` | ویدیوی اصلی | برش (trim) دوباره‌ی ویدیوی قبلاً-منتشرشده، جای‌گزین همان فایل‌ها |
+| `poster-replace` | تصویر (jpg/png/webp) | جایگزینی پوستر ویدیوی قبلاً-منتشرشده (بدون ffmpeg) |
 
 **افزودن/جایگزینی زیرنویس یا دوبله به ویدیوی از-قبل-منتشرشده** (بدون پردازش مجدد ویدیو):
 
@@ -334,8 +338,18 @@ weft jobs create ./dub_fa.mp3 --profile dub-add --lang fa --name movie --path Se
 .\weft.exe workers      # worker ها (busy/idle + task جاری)
 .\weft.exe plugins      # پلاگین‌های فعال
 .\weft.exe metrics      # خروجی Prometheus
-.\weft.exe benchmark    # بنچمارک CPU/ffmpeg
+.\weft.exe benchmark    # بنچمارک CPU/ffmpeg (یا benchmark get برای آخرین نتیجه)
 .\weft.exe system       # وضعیت سرور: RAM/CPU/دیسک + uptime
+.\weft.exe dashboard    # داشبورد زنده ترمینال: job/صف/worker/سیستم با کنترل کیبورد
+```
+
+### پشتیبان‌گیری از پیکربندی و cron
+
+```powershell
+.\weft.exe config export -o backup.yaml    # خروجی کامل پیکربندی در حال اجرا
+.\weft.exe config import backup.yaml       # بازنویسی weft.yaml (نیاز به ری‌استارت)
+.\weft.exe cron list                       # زمان‌بندی cleanup/benchmark/health_scan
+.\weft.exe cron run cleanup                # اجرای فوری بدون صبر برای زمان‌بندی
 ```
 
 ---

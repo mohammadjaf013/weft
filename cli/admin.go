@@ -111,8 +111,10 @@ func cmdWebhooks(args []string) error {
 		return webhooksCreate(rest)
 	case "delete":
 		return webhooksDelete(rest)
+	case "replay":
+		return webhooksReplay(rest)
 	default:
-		return fmt.Errorf("webhooks: unknown subcommand %q (list|create|delete)", sub)
+		return fmt.Errorf("webhooks: unknown subcommand %q (list|create|delete|replay)", sub)
 	}
 }
 
@@ -186,6 +188,28 @@ func webhooksDelete(args []string) error {
 		return err
 	}
 	fmt.Printf("webhook %s deleted\n", pos[0])
+	return nil
+}
+
+func webhooksReplay(args []string) error {
+	fs := remoteFlagSet("webhooks replay")
+	rf, err := parseRemote(fs, args)
+	if err != nil {
+		return err
+	}
+	pos := fs.Args()
+	if len(pos) == 0 {
+		return fmt.Errorf("webhooks replay: event id argument is required")
+	}
+	c := newClient(rf)
+	var out struct {
+		EventID  string `json:"event_id"`
+		Replayed int    `json:"replayed"`
+	}
+	if err := c.post("/webhooks/"+pos[0]+"/replay", map[string]any{}, &out); err != nil {
+		return err
+	}
+	fmt.Printf("event %s: %d dead-lettered delivery(s) reset to pending\n", out.EventID, out.Replayed)
 	return nil
 }
 
@@ -493,7 +517,16 @@ func cmdMetrics(args []string) error {
 	return nil
 }
 
+// cmdBenchmark defaults to triggering a fresh run (POST /benchmark), matching
+// existing behavior. "get"/"show" fetches the last recorded result (GET
+// /benchmark) instead of running a new one.
 func cmdBenchmark(args []string) error {
+	if len(args) > 0 {
+		switch args[0] {
+		case "get", "show":
+			return benchmarkGet(args[1:])
+		}
+	}
 	fs := remoteFlagSet("benchmark")
 	rf, err := parseRemote(fs, args)
 	if err != nil {
@@ -508,6 +541,29 @@ func cmdBenchmark(args []string) error {
 		return err
 	}
 	fmt.Printf("benchmark done — cpu_score=%.2f ffmpeg_score=%.2f\n", out.CPUScore, out.FFmpegScore)
+	return nil
+}
+
+func benchmarkGet(args []string) error {
+	fs := remoteFlagSet("benchmark get")
+	rf, err := parseRemote(fs, args)
+	if err != nil {
+		return err
+	}
+	c := newClient(rf)
+	var out struct {
+		CPUScore    float64 `json:"cpu_score"`
+		FFmpegScore float64 `json:"ffmpeg_score"`
+		DiskIOScore float64 `json:"disk_io_score"`
+		MemoryScore float64 `json:"memory_score"`
+		CreatedAt   string  `json:"created_at"`
+	}
+	if err := c.get("/benchmark", &out); err != nil {
+		return err
+	}
+	fmt.Printf("last benchmark (%s):\n", out.CreatedAt)
+	fmt.Printf("  cpu_score=%.2f ffmpeg_score=%.2f disk_io_score=%.2f memory_score=%.2f\n",
+		out.CPUScore, out.FFmpegScore, out.DiskIOScore, out.MemoryScore)
 	return nil
 }
 

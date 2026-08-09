@@ -189,6 +189,46 @@ func (c *client) del(path string, out any) error {
 	return c.do(http.MethodDelete, path, nil, out)
 }
 
+// patch performs a PATCH with a JSON body and decodes JSON into out.
+func (c *client) patch(path string, body any, out any) error {
+	return c.do(http.MethodPatch, path, body, out)
+}
+
+// postRaw sends a POST with a pre-encoded body (e.g. YAML, not JSON) and the
+// given Content-Type, decoding a JSON response into out.
+func (c *client) postRaw(path, contentType string, body []byte, out any) error {
+	req, err := http.NewRequest(http.MethodPost, c.baseURL+path, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", contentType)
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("api %s %s: %w", http.MethodPost, path, err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		var e struct {
+			Error struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if json.Unmarshal(raw, &e) == nil && e.Error.Message != "" {
+			return fmt.Errorf("api error %d %s: %s", resp.StatusCode, e.Error.Code, e.Error.Message)
+		}
+		return fmt.Errorf("api error %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	if out != nil && len(raw) > 0 {
+		return json.Unmarshal(raw, out)
+	}
+	return nil
+}
+
 func (c *client) do(method, path string, body any, out any) error {
 	var rdr io.Reader
 	if body != nil {

@@ -29,23 +29,54 @@ func TestBaseName(t *testing.T) {
 
 func TestTrimFromParams(t *testing.T) {
 	// no trim params -> inactive
-	if tr := TrimFromParams(map[string]any{}, 100); tr.Active() {
+	tr, err := TrimFromParams(map[string]any{}, 100)
+	if err != nil {
+		t.Fatalf("empty params must not error: %v", err)
+	}
+	if tr.Active() {
 		t.Fatalf("empty params must be inactive, got %+v", tr)
 	}
 	// both sides
-	tr := TrimFromParams(map[string]any{"trim_start": float64(50), "trim_end": float64(10)}, 100)
+	tr, err = TrimFromParams(map[string]any{"trim_start": float64(50), "trim_end": float64(10)}, 100)
+	if err != nil {
+		t.Fatalf("both-sides trim must not error: %v", err)
+	}
 	if !tr.Active() || tr.Start != 50 || tr.Keep != 40 {
 		t.Fatalf("trim = %+v, want start=50 keep=40", tr)
 	}
 	// only start
-	tr = TrimFromParams(map[string]any{"trim_start": float64(20)}, 100)
+	tr, err = TrimFromParams(map[string]any{"trim_start": float64(20)}, 100)
+	if err != nil {
+		t.Fatalf("start-only trim must not error: %v", err)
+	}
 	if tr.Start != 20 || tr.Keep != 80 {
 		t.Fatalf("start-only trim = %+v", tr)
 	}
 	// only end
-	tr = TrimFromParams(map[string]any{"trim_end": float64(5)}, 100)
+	tr, err = TrimFromParams(map[string]any{"trim_end": float64(5)}, 100)
+	if err != nil {
+		t.Fatalf("end-only trim must not error: %v", err)
+	}
 	if tr.Start != 0 || tr.Keep != 95 {
 		t.Fatalf("end-only trim = %+v", tr)
+	}
+	// trim_start with unknown duration (probe failed) is fine: it doesn't need
+	// the duration to skip from the start, so Keep=0 (unlimited) is correct.
+	tr, err = TrimFromParams(map[string]any{"trim_start": float64(20)}, 0)
+	if err != nil {
+		t.Fatalf("start-only trim with unknown duration must not error: %v", err)
+	}
+	if tr.Start != 20 || tr.Keep != 0 {
+		t.Fatalf("start-only trim w/ unknown duration = %+v, want start=20 keep=0", tr)
+	}
+	// trim_end with unknown duration (probe failed) MUST error instead of
+	// silently producing an untrimmed clip.
+	if _, err := TrimFromParams(map[string]any{"trim_end": float64(5)}, 0); err == nil {
+		t.Fatal("trim_end with unprobeable duration must error, got nil")
+	}
+	// trim_start + trim_end leaving nothing to encode must error.
+	if _, err := TrimFromParams(map[string]any{"trim_start": float64(90), "trim_end": float64(20)}, 100); err == nil {
+		t.Fatal("trim window leaving no content must error, got nil")
 	}
 }
 

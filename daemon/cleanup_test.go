@@ -71,6 +71,38 @@ func TestCleanerDeletesSourceAndWorkDirs(t *testing.T) {
 	}
 }
 
+// TestCleanerDeletesCacheDir verifies the per-job remote-input cache
+// (created by fetchFromSourceServer/fetchHTTP in serve.go) is removed once
+// the job finishes, same as the per-task work dirs.
+func TestCleanerDeletesCacheDir(t *testing.T) {
+	root := t.TempDir()
+	store, err := sqlite.Open(filepath.Join(root, "weft.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	workRoot := filepath.Join(root, "workroot")
+	cacheDir := filepath.Join(workRoot, "cache", "j3")
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cacheDir, "fetched.mp4"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveJob(ctx, core.Job{ID: "j3", Status: core.JobCompleted, SourceServerID: 1, InputRef: "movies/foo.mp4"}); err != nil {
+		t.Fatal(err)
+	}
+
+	c := &cleaner{store: store, workRoot: workRoot}
+	c.cleanupJob(ctx, "j3")
+
+	if _, err := os.Stat(cacheDir); !os.IsNotExist(err) {
+		t.Errorf("cache dir not deleted: %v", err)
+	}
+}
+
 func TestCleanerSkipsRemoteSource(t *testing.T) {
 	root := t.TempDir()
 	store, err := sqlite.Open(filepath.Join(root, "weft.db"))

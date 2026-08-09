@@ -105,7 +105,7 @@ func TestJobLifecycleToWebhook(t *testing.T) {
 	d, err := daemon.Open(c, nil, daemon.Options{
 		Executor:       ffexec.NewFake(core.Result{ExitCode: 0}, nil),
 		PluginRegister: registerStubs,
-		InputResolver: func(job core.Job) (string, error) {
+		InputResolver: func(ctx context.Context, job core.Job) (string, error) {
 			return filepath.Join(workRoot, string(job.ID)+".in"), nil
 		},
 	})

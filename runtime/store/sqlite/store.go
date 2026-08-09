@@ -191,6 +191,7 @@ func migrateColumns(db *sql.DB) error {
 		"ALTER TABLE task_outputs ADD COLUMN dir TEXT NOT NULL DEFAULT ''",
 		"ALTER TABLE jobs ADD COLUMN dest_path TEXT NOT NULL DEFAULT ''",
 		"ALTER TABLE jobs ADD COLUMN delete_source INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE jobs ADD COLUMN source_server_id INTEGER NOT NULL DEFAULT 0",
 	}
 	for _, s := range stmts {
 		if _, err := db.Exec(s); err != nil && !strings.Contains(err.Error(), "duplicate column") {
@@ -251,12 +252,12 @@ func (s *Store) SaveJobEvent(ctx context.Context, j core.Job, e core.Event) erro
 	if j.DeleteSource {
 		delSrc = 1
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs(id,status,priority,profile,destination_id,dest_path,input_ref,delete_source,verified,error,created_at,updated_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs(id,status,priority,profile,destination_id,dest_path,input_ref,delete_source,source_server_id,verified,error,created_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET status=excluded.status, priority=excluded.priority, profile=excluded.profile,
 		 destination_id=excluded.destination_id, dest_path=excluded.dest_path, input_ref=excluded.input_ref,
-		 delete_source=excluded.delete_source, verified=excluded.verified, error=excluded.error, updated_at=excluded.updated_at`,
-		j.ID, string(j.Status), string(j.Priority), j.Profile, j.DestinationID, j.DestPath, j.InputRef, delSrc, verified, j.Error, ts(j.CreatedAt), ts(j.UpdatedAt)); err != nil {
+		 delete_source=excluded.delete_source, source_server_id=excluded.source_server_id, verified=excluded.verified, error=excluded.error, updated_at=excluded.updated_at`,
+		j.ID, string(j.Status), string(j.Priority), j.Profile, j.DestinationID, j.DestPath, j.InputRef, delSrc, j.SourceServerID, verified, j.Error, ts(j.CreatedAt), ts(j.UpdatedAt)); err != nil {
 		return err
 	}
 	if e.ID != "" {
@@ -268,12 +269,12 @@ func (s *Store) SaveJobEvent(ctx context.Context, j core.Job, e core.Event) erro
 }
 
 func (s *Store) LoadJob(ctx context.Context, id core.JobID) (core.Job, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id,status,priority,profile,destination_id,dest_path,input_ref,delete_source,verified,error,created_at,updated_at FROM jobs WHERE id=?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT id,status,priority,profile,destination_id,dest_path,input_ref,delete_source,source_server_id,verified,error,created_at,updated_at FROM jobs WHERE id=?`, id)
 	var j core.Job
 	var status, priority string
 	var verified, delSrc int
 	var created, updated string
-	err := row.Scan(&j.ID, &status, &priority, &j.Profile, &j.DestinationID, &j.DestPath, &j.InputRef, &delSrc, &verified, &j.Error, &created, &updated)
+	err := row.Scan(&j.ID, &status, &priority, &j.Profile, &j.DestinationID, &j.DestPath, &j.InputRef, &delSrc, &j.SourceServerID, &verified, &j.Error, &created, &updated)
 	if errors.Is(err, sql.ErrNoRows) {
 		return core.Job{}, core.ErrJobNotFound
 	}
@@ -289,8 +290,13 @@ func (s *Store) LoadJob(ctx context.Context, id core.JobID) (core.Job, error) {
 	return j, nil
 }
 
+// defaultJobListLimit caps ListJobs when the caller doesn't specify one, so
+// an unfiltered `GET /jobs` / `weft jobs list` on a long-lived install can't
+// return every job ever created.
+const defaultJobListLimit = 100
+
 func (s *Store) ListJobs(ctx context.Context, filter core.JobFilter) ([]core.Job, error) {
-	q := `SELECT id,status,priority,profile,destination_id,dest_path,input_ref,delete_source,verified,error,created_at,updated_at FROM jobs`
+	q := `SELECT id,status,priority,profile,destination_id,dest_path,input_ref,delete_source,source_server_id,verified,error,created_at,updated_at FROM jobs`
 	var args []any
 	where := ""
 	if filter.Status != "" {
@@ -315,11 +321,13 @@ func (s *Store) ListJobs(ctx context.Context, filter core.JobFilter) ([]core.Job
 		where += ` created_at < ?`
 		args = append(args, filter.Cursor)
 	}
-	if filter.Limit > 0 {
-		where += ` LIMIT ?`
-		args = append(args, filter.Limit)
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = defaultJobListLimit
 	}
-	rows, err := s.db.QueryContext(ctx, q+where+` ORDER BY created_at DESC`, args...)
+	// LIMIT must follow ORDER BY, not be folded into the WHERE clause.
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx, q+where+` ORDER BY created_at DESC LIMIT ?`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -330,7 +338,56 @@ func (s *Store) ListJobs(ctx context.Context, filter core.JobFilter) ([]core.Job
 		var status, priority string
 		var verified, delSrc int
 		var created, updated string
-		if err := rows.Scan(&j.ID, &status, &priority, &j.Profile, &j.DestinationID, &j.DestPath, &j.InputRef, &delSrc, &verified, &j.Error, &created, &updated); err != nil {
+		if err := rows.Scan(&j.ID, &status, &priority, &j.Profile, &j.DestinationID, &j.DestPath, &j.InputRef, &delSrc, &j.SourceServerID, &verified, &j.Error, &created, &updated); err != nil {
+			return nil, err
+		}
+		j.Status = core.JobStatus(status)
+		j.Priority = core.Priority(priority)
+		j.Verified = verified == 1
+		j.DeleteSource = delSrc == 1
+		j.CreatedAt = parseTS(created)
+		j.UpdatedAt = parseTS(updated)
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
+// UpdateJobPriority changes a job's priority while it's still queued or
+// reserved (per the design doc's "priority can change while a job is still
+// queued" claim — once a task is actually running, reordering the queue
+// can't affect it, so this is intentionally scoped to the pre-running
+// states). Returns (false, nil) — not an error — when the job isn't in one
+// of those two statuses, so the caller can 409 instead of silently no-oping.
+func (s *Store) UpdateJobPriority(ctx context.Context, id core.JobID, p core.Priority) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `UPDATE jobs SET priority=?, updated_at=? WHERE id=? AND status IN (?,?)`,
+		string(p), ts(core.Now()), id, core.JobQueued, core.JobReserved)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n == 1, nil
+}
+
+// ListActiveJobs returns every job not in a terminal status, via a single
+// indexed query (idx_jobs_status) instead of a full unfiltered scan — the
+// scheduler's poll loop calls this every ~500ms per worker, so an unfiltered
+// ListJobs(ctx, JobFilter{}) here would re-read the entire job history
+// (including years of completed jobs) on every tick.
+func (s *Store) ListActiveJobs(ctx context.Context) ([]core.Job, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id,status,priority,profile,destination_id,dest_path,input_ref,delete_source,source_server_id,verified,error,created_at,updated_at
+		FROM jobs WHERE status NOT IN (?,?,?,?,?)`,
+		core.JobCompleted, core.JobCancelled, core.JobFailed, core.JobTimeout, core.JobDeadLetter)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []core.Job{}
+	for rows.Next() {
+		var j core.Job
+		var status, priority string
+		var verified, delSrc int
+		var created, updated string
+		if err := rows.Scan(&j.ID, &status, &priority, &j.Profile, &j.DestinationID, &j.DestPath, &j.InputRef, &delSrc, &j.SourceServerID, &verified, &j.Error, &created, &updated); err != nil {
 			return nil, err
 		}
 		j.Status = core.JobStatus(status)
@@ -413,9 +470,63 @@ func insertEventTx(ctx context.Context, tx *sql.Tx, e core.Event) error {
 	if payload == "" {
 		payload = "{}"
 	}
-	_, err := tx.ExecContext(ctx, `INSERT INTO events(id,job_id,task_id,event,payload,created_at) VALUES(?,?,?,?,?,?)`,
-		e.ID, e.JobID, e.TaskID, string(e.Kind), payload, ts(e.CreatedAt))
-	return err
+	if _, err := tx.ExecContext(ctx, `INSERT INTO events(id,job_id,task_id,event,payload,created_at) VALUES(?,?,?,?,?,?)`,
+		e.ID, e.JobID, e.TaskID, string(e.Kind), payload, ts(e.CreatedAt)); err != nil {
+		return err
+	}
+	return enqueueOutboxTx(ctx, tx, e)
+}
+
+// enqueueOutboxTx inserts one outbox row per webhook whose Events list matches
+// e's wire name, in the SAME transaction as the events-table insert above.
+// This is what makes the "no missed data" guarantee real: a crash between
+// "state changed" and "webhook enqueued" cannot happen because they're one
+// atomic write, not a separate async step reading the event bus afterward.
+func enqueueOutboxTx(ctx context.Context, tx *sql.Tx, e core.Event) error {
+	rows, err := tx.QueryContext(ctx, `SELECT id, events FROM webhooks`)
+	if err != nil {
+		return err
+	}
+	type wh struct {
+		id     string
+		events []string
+	}
+	var whs []wh
+	for rows.Next() {
+		var id, evs string
+		if err := rows.Scan(&id, &evs); err != nil {
+			rows.Close()
+			return err
+		}
+		var list []string
+		_ = json.Unmarshal([]byte(evs), &list)
+		whs = append(whs, wh{id: id, events: list})
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	rows.Close()
+
+	wire := core.WireName(e.Kind)
+	now := ts(core.Now())
+	for _, w := range whs {
+		matched := false
+		for _, s := range w.events {
+			if s == wire || s == "*" {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO outbox(id,event_id,webhook_id,status,attempts,next_attempt_at,created_at)
+			VALUES(?,?,?, 'pending', 0, ?, ?)`,
+			core.NewID("ob"), e.ID, w.id, now, now); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) LoadTask(ctx context.Context, id core.TaskID) (core.Task, error) {
@@ -447,6 +558,54 @@ func (s *Store) LoadTask(ctx context.Context, id core.TaskID) (core.Task, error)
 
 func (s *Store) ListTasks(ctx context.Context, jobID core.JobID) ([]core.Task, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id,job_id,kind,status,progress_percent,depends_on,worker_id,lease_expires_at,started_at,finished_at,error,params FROM tasks WHERE job_id=?`, jobID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []core.Task{}
+	for rows.Next() {
+		var t core.Task
+		var status, deps, lease, started, finished string
+		var params string
+		if err := rows.Scan(&t.ID, &t.JobID, &t.Kind, &status, &t.Progress, &deps, &t.WorkerID, &lease, &started, &finished, &t.Error, &params); err != nil {
+			return nil, err
+		}
+		t.Status = core.TaskStatus(status)
+		_ = json.Unmarshal([]byte(deps), &t.DependsOn)
+		_ = json.Unmarshal([]byte(params), &t.Params)
+		if lease != "" {
+			lt := parseTS(lease)
+			t.LeaseExpiresAt = &lt
+		}
+		if started != "" {
+			st := parseTS(started)
+			t.StartedAt = &st
+		}
+		if finished != "" {
+			ft := parseTS(finished)
+			t.FinishedAt = &ft
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// ListTasksForJobs batch-loads tasks for several jobs in one query (WHERE
+// job_id IN (...)) so the scheduler's poll loop avoids an N+1 — one ListTasks
+// round-trip per active job on every tick — for what is otherwise the same
+// data.
+func (s *Store) ListTasksForJobs(ctx context.Context, jobIDs []core.JobID) ([]core.Task, error) {
+	if len(jobIDs) == 0 {
+		return []core.Task{}, nil
+	}
+	placeholders := strings.Repeat("?,", len(jobIDs))
+	placeholders = placeholders[:len(placeholders)-1]
+	args := make([]any, len(jobIDs))
+	for i, id := range jobIDs {
+		args[i] = id
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id,job_id,kind,status,progress_percent,depends_on,worker_id,lease_expires_at,started_at,finished_at,error,params
+		FROM tasks WHERE job_id IN (`+placeholders+`)`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -721,6 +880,49 @@ func (s *Store) PruneEvents(ctx context.Context, olderThan time.Time) (int64, er
 		return 0, err
 	}
 	res, err := tx.ExecContext(ctx, `DELETE FROM events WHERE created_at < ?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, tx.Commit()
+}
+
+// PruneJobs bulk-deletes jobs in a terminal status (completed, cancelled,
+// failed, dead_letter — NOT timeout, since a timed-out job can still be
+// retried) older than the given cutoff, cascading the same way DeleteJob does
+// for a single job. Implements cron.cleanup.retention_hours so job history
+// doesn't accumulate forever. Returns the number of jobs removed.
+func (s *Store) PruneJobs(ctx context.Context, olderThan time.Time) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	cutoff := ts(olderThan)
+
+	terminal := []any{
+		string(core.JobCompleted), string(core.JobCancelled),
+		string(core.JobFailed), string(core.JobDeadLetter),
+	}
+	where := `job_id IN (SELECT id FROM jobs WHERE created_at < ? AND status IN (?,?,?,?))`
+	args := append([]any{cutoff}, terminal...)
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM outbox WHERE event_id IN (SELECT id FROM events WHERE `+where+`)`, args...); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM events WHERE `+where, args...); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM task_outputs WHERE `+where, args...); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM task_logs WHERE `+where, args...); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM tasks WHERE `+where, args...); err != nil {
+		return 0, err
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM jobs WHERE created_at < ? AND status IN (?,?,?,?)`, args...)
 	if err != nil {
 		return 0, err
 	}

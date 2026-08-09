@@ -74,6 +74,14 @@ func (c *cleaner) cleanupJob(ctx context.Context, jobID core.JobID) {
 	}
 	// Drop the now-empty work container if nothing else runs there.
 	os.Remove(filepath.Join(c.workRoot, "work"))
+
+	// Remove the per-job remote-input cache (fetchFromSourceServer/fetchHTTP
+	// in serve.go), if this job ever fetched one — safe to remove
+	// unconditionally once the job's finished, regardless of DeleteSource.
+	cacheDir := filepath.Join(c.workRoot, "cache", string(jobID))
+	if err := os.RemoveAll(cacheDir); err != nil {
+		log.Printf("cleanup: remove %s: %v", cacheDir, err)
+	}
 }
 
 // sourcePath extracts a local filesystem path from an input ref, or "" when the

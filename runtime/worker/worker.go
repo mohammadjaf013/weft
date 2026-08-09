@@ -30,15 +30,23 @@ type Options struct {
 	// Optional; if nil, outputs are not retained and upload tasks get no assets.
 	OutputStore OutputStore
 	// InputResolver maps a job's InputRef to a local InputURI the executor can
-	// read (e.g. local:/abs/path.mp4 → /abs/path.mp4). If nil, InputURI is left
-	// empty and plugins that require a resolvable input fail fast.
-	InputResolver func(job core.Job) (string, error)
+	// read (e.g. local:/abs/path.mp4 → /abs/path.mp4). For a remote source
+	// (job.SourceServerID set, or an http(s):// InputRef) this fetches the
+	// file into a local cache — a potentially slow operation, hence the ctx
+	// for cancellation. If nil, InputURI is left empty and plugins that
+	// require a resolvable input fail fast.
+	InputResolver func(ctx context.Context, job core.Job) (string, error)
 	// Gate is a resource-aware scheduling hook: the worker only picks a task up
 	// when Gate() returns true (and nil means "always pick"). Used to keep the
 	// host under scheduler.max_cpu_percent / max_load_average: when over the
 	// threshold the worker idles and leaves the task in the queue instead of
 	// making the machine slower for everyone.
 	Gate func() bool
+	// Budget, when set, gates task pickup on the plugin's declared
+	// Capabilities() cost (EstimatedCPU/EstimatedRAMMB) instead of measured
+	// host usage — see Budget's doc comment for how this differs from Gate.
+	// nil means "no declared-cost admission control" (only Gate applies).
+	Budget *Budget
 }
 
 // OutputStore is the optional persistence needed to feed the upload task.
@@ -50,7 +58,10 @@ type OutputStore interface {
 type Worker struct {
 	id   string
 	opts Options
-	// current state for /workers
+	// current state for /workers, read from a different goroutine (the API
+	// handler backing GET /workers) than the one that writes it (this worker's
+	// own Run loop) — guarded by mu.
+	mu            sync.RWMutex
 	currentTask   string
 	status        string
 	lastHeartbeat time.Time
@@ -68,16 +79,38 @@ func New(id string, opts Options) *Worker {
 
 func (w *Worker) ID() string { return w.id }
 
-func (w *Worker) CurrentTask() string { return w.currentTask }
+func (w *Worker) CurrentTask() string {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.currentTask
+}
 
 func (w *Worker) Status() string {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
 	if w.currentTask != "" {
 		return "busy"
 	}
 	return "idle"
 }
 
-func (w *Worker) LastHeartbeat() time.Time { return w.lastHeartbeat }
+func (w *Worker) LastHeartbeat() time.Time {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.lastHeartbeat
+}
+
+func (w *Worker) setCurrentTask(id string) {
+	w.mu.Lock()
+	w.currentTask = id
+	w.mu.Unlock()
+}
+
+func (w *Worker) setHeartbeat(t time.Time) {
+	w.mu.Lock()
+	w.lastHeartbeat = t
+	w.mu.Unlock()
+}
 
 // Run polls the scheduler until ctx is cancelled.
 func (w *Worker) Run(ctx context.Context) error {
@@ -97,7 +130,18 @@ func (w *Worker) Run(ctx context.Context) error {
 
 // cycle performs one scheduling step. When a resource Gate is configured and
 // the host is over its threshold, the worker skips this cycle and leaves the
-// queued task for later instead of competing for saturated CPU.
+// queued task for later instead of competing for saturated CPU. When a
+// Budget is configured, the task's plugin-declared cost must also fit inside
+// the remaining budget — reserved for the lifetime of this cycle (release is
+// deferred, since execute() blocks until the task fully finishes) so a wide
+// DAG can't over-commit the box before Gate's measured CPU sampling would
+// even notice.
+//
+// Known limitation: NextReady always returns the single highest-priority
+// ready task. If that specific task doesn't fit the budget, this worker
+// skips the whole cycle rather than picking a cheaper, lower-priority ready
+// task instead — budget-aware task *selection* (not just admission) would
+// need a scheduler change, out of scope here.
 func (w *Worker) cycle(ctx context.Context) error {
 	if w.opts.Gate != nil && !w.opts.Gate() {
 		return nil
@@ -108,6 +152,16 @@ func (w *Worker) cycle(ctx context.Context) error {
 	}
 	if task == nil {
 		return nil
+	}
+
+	if w.opts.Budget != nil {
+		cpu, ramMB := w.taskCost(task.Kind)
+		if !w.opts.Budget.TryReserve(cpu, ramMB) {
+			// over budget this cycle; leave the task ready for a later cycle,
+			// once something else finishes and frees capacity.
+			return nil
+		}
+		defer w.opts.Budget.Release(cpu, ramMB)
 	}
 
 	// reserve a lease
@@ -122,12 +176,28 @@ func (w *Worker) cycle(ctx context.Context) error {
 	return w.execute(ctx, *reserved)
 }
 
+// taskCost looks up a task kind's declared resource cost from its plugin's
+// Capabilities(). Unknown kind (shouldn't happen — the registry already
+// resolved it once in NextReady's caller path) costs nothing, so a missing
+// plugin can't wedge the budget shut.
+func (w *Worker) taskCost(kind string) (cpu float64, ramMB int) {
+	if w.opts.Registry == nil {
+		return 0, 0
+	}
+	p, ok := w.opts.Registry.PluginFor(kind)
+	if !ok {
+		return 0, 0
+	}
+	caps := p.Capabilities()
+	return caps.EstimatedCPU, caps.EstimatedRAMMB
+}
+
 // reserve atomically claims a task for this worker and transitions the job to
 // running. When another worker already leased the task it returns nil, nil so
 // the caller skips it (two workers both saw it runnable in NextReady).
 func (w *Worker) reserve(ctx context.Context, task core.Task) (*core.Task, error) {
-	w.currentTask = string(task.ID)
-	w.lastHeartbeat = core.Now()
+	w.setCurrentTask(string(task.ID))
+	w.setHeartbeat(core.Now())
 
 	// task-level transition: leased (atomic claim so >1 worker never
 	// double-processes the same task)
@@ -142,7 +212,7 @@ func (w *Worker) reserve(ctx context.Context, task core.Task) (*core.Task, error
 		return &task, err
 	}
 	if !claimed {
-		w.currentTask = ""
+		w.setCurrentTask("")
 		return nil, nil
 	}
 
@@ -172,6 +242,15 @@ func (w *Worker) reserve(ctx context.Context, task core.Task) (*core.Task, error
 	case core.JobPaused:
 		if err := w.opts.SM.Transition(ctx, job.ID, core.JobResumed, ""); err != nil {
 			return &task, err
+		}
+	case core.JobResumed:
+		// upload-phase tasks move the job into the uploading state, same as the
+		// JobRunning case — a resumed job's later tasks must still be able to
+		// reach uploading/completed instead of staying stuck at "resumed".
+		if task.Kind == "upload" {
+			if err := w.opts.SM.Transition(ctx, job.ID, core.JobUploading, ""); err != nil {
+				return &task, err
+			}
 		}
 	}
 	return &task, nil
@@ -303,9 +382,9 @@ func (w *Worker) execute(ctx context.Context, task core.Task) error {
 		in.Params[k] = v
 	}
 
-	// upload / update_master tasks: resolve destination storage so the plugin
-	// can write directly to the published location.
-	if task.Kind == "upload" || task.Kind == "update_master" {
+	// upload / update_master / poster_upload tasks: resolve destination
+	// storage so the plugin can write directly to the published location.
+	if task.Kind == "upload" || task.Kind == "update_master" || task.Kind == "poster_upload" {
 		if w.opts.Storage != nil {
 			st, serr := w.opts.Storage(job)
 			if serr != nil {
@@ -326,10 +405,10 @@ func (w *Worker) execute(ctx context.Context, task core.Task) error {
 
 	// resolve the source input to a local path the executor can read
 	if w.opts.InputResolver != nil {
-		uri, rerr := w.opts.InputResolver(job)
+		uri, rerr := w.opts.InputResolver(ctx, job)
 		if rerr != nil {
 			w.opts.Sched.MarkFailed(ctx, task.ID, rerr)
-			w.currentTask = ""
+			w.setCurrentTask("")
 			return nil
 		}
 		in.InputURI = uri
@@ -352,7 +431,7 @@ func (w *Worker) execute(ctx context.Context, task core.Task) error {
 	w.saveLog(ctx, task, logBuf.String())
 	if err != nil {
 		w.opts.Sched.MarkFailed(ctx, task.ID, err)
-		w.currentTask = ""
+		w.setCurrentTask("")
 		return nil // failure is surfaced via job state, not worker error
 	}
 
@@ -360,7 +439,7 @@ func (w *Worker) execute(ctx context.Context, task core.Task) error {
 	if w.opts.OutputStore != nil && len(out.Assets) > 0 {
 		if err := w.opts.OutputStore.SaveTaskOutputs(ctx, task.ID, task.JobID, out.Assets); err != nil {
 			w.opts.Sched.MarkFailed(ctx, task.ID, err)
-			w.currentTask = ""
+			w.setCurrentTask("")
 			return nil
 		}
 	}
@@ -368,7 +447,7 @@ func (w *Worker) execute(ctx context.Context, task core.Task) error {
 	if err := w.opts.Sched.MarkDone(ctx, task.ID); err != nil {
 		return err
 	}
-	w.currentTask = ""
+	w.setCurrentTask("")
 	return nil
 }
 
