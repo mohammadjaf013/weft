@@ -95,6 +95,24 @@ func (m *memStore) UpdateTaskProgress(ctx context.Context, id TaskID, status Tas
 	return nil
 }
 
+func (m *memStore) TryLease(ctx context.Context, t Task, workerID string, leaseExpiresAt, startedAt time.Time) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.tasks[t.ID]
+	if !ok {
+		return false, fmt.Errorf("task %s not found", t.ID)
+	}
+	if cur.Status != TaskPending && cur.Status != TaskReady {
+		return false, nil
+	}
+	cur.Status = TaskLeased
+	cur.WorkerID = workerID
+	cur.LeaseExpiresAt = &leaseExpiresAt
+	cur.StartedAt = &startedAt
+	m.tasks[t.ID] = cur
+	return true, nil
+}
+
 func (m *memStore) LoadTask(ctx context.Context, id TaskID) (Task, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

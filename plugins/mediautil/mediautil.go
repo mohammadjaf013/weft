@@ -8,6 +8,37 @@ import (
 	"strings"
 )
 
+// Trim describes an optional sub-clip window applied to an ffmpeg command.
+// Start is the number of seconds to skip from the beginning; Keep is how many
+// seconds to include after that point (0 = the rest of the clip). A zero
+// Start with a zero Keep means "no trim".
+type Trim struct {
+	Start float64
+	Keep  float64
+}
+
+// Active reports whether a trim window was requested.
+func (t Trim) Active() bool { return t.Start > 0 || t.Keep > 0 }
+
+// InputArgs returns the input-side seek option (placed before -i). Fast seek:
+// ffmpeg jumps to the nearest keyframe at or before Start, then drops frames
+// until the exact point while re-encoding. Empty when no trim.
+func (t Trim) InputArgs() []string {
+	if !t.Active() {
+		return nil
+	}
+	return []string{"-ss", fmt.Sprintf("%.3f", t.Start)}
+}
+
+// OutputArgs returns the output-side duration limit (placed before each output
+// file). Empty when the trim window extends to the end of the clip.
+func (t Trim) OutputArgs() []string {
+	if t.Keep <= 0 {
+		return nil
+	}
+	return []string{"-t", fmt.Sprintf("%.3f", t.Keep)}
+}
+
 // Ladder defines the resolution ladder for a profile.
 type Rung struct {
 	Label   string // "360p"
@@ -114,13 +145,13 @@ func HLSArgs(input, outDir, name string, segSec int, bw string, r Rung) []string
 // has no audio stream (hasAudio=false) the audio map/codec are omitted —
 // `-map 0:a:0` on a silent source is a fatal ffmpeg error.
 func HLSMultiArgs(input string, ladder []Rung, outDir, base string, segSec int, hasAudio bool) []string {
-	return HLSMultiArgsCodec(input, ladder, outDir, base, segSec, hasAudio, "h264")
+	return HLSMultiArgsCodec(input, ladder, outDir, base, segSec, hasAudio, "h264", Trim{})
 }
 
 // HLSMultiArgsCodec is HLSMultiArgs for an explicit codec ("h264" → libx264,
 // "hevc" → libx265). The hls plugin passes the profile's codec through here so
 // vod-hevc produces real HEVC renditions instead of silently encoding H.264.
-func HLSMultiArgsCodec(input string, ladder []Rung, outDir, base string, segSec int, hasAudio bool, codec string) []string {
+func HLSMultiArgsCodec(input string, ladder []Rung, outDir, base string, segSec int, hasAudio bool, codec string, trim Trim) []string {
 	if segSec == 0 {
 		segSec = 6
 	}
@@ -128,8 +159,11 @@ func HLSMultiArgsCodec(input string, ladder []Rung, outDir, base string, segSec 
 	if codec == "hevc" {
 		enc, crf = "libx265", "26"
 	}
-	args := []string{"-hide_banner", "-nostdin", "-y", "-loglevel", "error", "-progress", "pipe:1", "-nostats",
-		"-i", input, "-max_muxing_queue_size", "4096"}
+	args := []string{"-hide_banner", "-nostdin", "-y", "-loglevel", "error", "-progress", "pipe:1", "-nostats"}
+	// -ss must precede -i (input seek); -t is placed before every output so
+	// every rendition of the single-pass command ends at the same clip end.
+	args = append(args, trim.InputArgs()...)
+	args = append(args, "-i", input, "-max_muxing_queue_size", "4096")
 	for _, r := range ladder {
 		name := r.Label
 		args = append(args,
@@ -145,7 +179,9 @@ func HLSMultiArgsCodec(input string, ladder []Rung, outDir, base string, segSec 
 			args = append(args, "-c:a", "aac", "-b:a", "128k")
 		}
 		args = append(args,
-			"-g", "50", "-keyint_min", "50", "-sc_threshold", "0",
+			"-g", "50", "-keyint_min", "50", "-sc_threshold", "0")
+		args = append(args, trim.OutputArgs()...)
+		args = append(args,
 			"-f", "hls",
 			"-hls_time", fmt.Sprintf("%d", segSec),
 			"-hls_list_size", "0",
@@ -261,21 +297,26 @@ func bitrateKbps(s string) int {
 }
 
 // AudioHLSArgs builds an audio-only HLS packager command (no video stream).
-func AudioHLSArgs(input, outDir, name string, segSec int, bitrate string) []string {
+func AudioHLSArgs(input, outDir, name string, segSec int, bitrate string, trim Trim) []string {
 	if segSec == 0 {
 		segSec = 6
 	}
 	if bitrate == "" {
 		bitrate = "128k"
 	}
-	return []string{
+	args := []string{"-hide_banner", "-nostdin", "-y", "-loglevel", "error", "-nostats"}
+	args = append(args, trim.InputArgs()...)
+	args = append(args,
 		"-i", input,
 		"-vn",
-		"-c:a", "aac", "-b:a", bitrate,
+		"-c:a", "aac", "-b:a", bitrate)
+	args = append(args, trim.OutputArgs()...)
+	args = append(args,
 		"-hls_time", fmt.Sprintf("%d", segSec),
 		"-hls_list_size", "0",
 		"-hls_playlist_type", "vod",
 		"-hls_segment_filename", fmt.Sprintf("%s/%s_%%d.ts", outDir, name),
 		fmt.Sprintf("%s/%s.m3u8", outDir, name),
-	}
+	)
+	return args
 }

@@ -297,7 +297,11 @@ curl -X POST http://127.0.0.1:8443/jobs \
 | `weft jobs get <id>` | `GET /jobs/{id}` |
 | `weft jobs events <id>` | `GET /jobs/{id}/events` |
 | `weft jobs create <input> --profile <p>` | `POST /jobs` |
+| `weft jobs log <id> <task>` | `GET /jobs/{id}/tasks/{task}/log` |
+| `weft jobs asset <id> <name>` | `GET /jobs/{id}/assets/{name}` |
+| `weft jobs delete <id>` | `DELETE /jobs/{id}` |
 | `weft jobs action <id> cancel` | `POST /jobs/{id}/cancel` |
+| `weft workers scale <count>` | `POST /workers/scale` |
 | `weft queue` | `GET /queue` |
 | `weft workers` | `GET /workers` |
 | `weft storage list` | `GET /storage/servers` |
@@ -315,6 +319,33 @@ curl -X POST http://127.0.0.1:8443/jobs \
 | `weft benchmark` | `POST /benchmark` |
 
 فلگ‌های مشترک CLI: `--api <url>` و `--key <token>` و `--config <path>`.
+
+### برش (trim) و تامبنیل سفارشی هنگام ساخت job
+
+`weft jobs create` فلگ‌های بیشتری می‌پذیرد:
+
+| فلگ | معنی |
+|---|---|
+| `--trim-start <s>` | N ثانیه از ابتدای کلیپ قبل از HLS حذف شود (مثلاً `50` یعنی از ثانیه ۵۰ شروع شود) |
+| `--trim-end <s>` | N ثانیه از انتهای کلیپ حذف شود (مثلاً `10` یعنی ۱۰ ثانیه آخر بریده شود) |
+| `--thumb-count <n>` | به جای پوستر/اسپرایت/استیلز پیش‌فرض، دقیقاً n تامبنیل هم‌فاصله ساخته و آپلود شود |
+| `--thumb-size <sz>` | اندازه تامبنیل: `1080x1080` یا `original` (فقط با `--thumb-count`) |
+
+مثال: از ثانیه ۵۰ تا ۱۰ ثانیه مانده به انتها، با ۵ تامبنیل 1080×1080:
+
+```
+weft jobs create /in/movie.mp4 --profile vod-h264 \
+  --trim-start 50 --trim-end 10 --thumb-count 5 --thumb-size 1080x1080
+```
+
+- تریم روی task های `hls` و `thumbnail` اعمال می‌شود تا تامبنیل‌ها با بازه
+  بریده‌شده هماهنگ باشند.
+- بعد از پایان job، تامبنیل‌ها در پاسخ `GET /jobs/{id}` (لیست `assets`) و روی
+  storage دیده می‌شوند. برای گرفتن یک تامبنیل به‌صورت base64:
+
+```
+weft jobs asset <job-id> thumbnails/<movie>_thumb_01.jpg
+```
 
 ---
 

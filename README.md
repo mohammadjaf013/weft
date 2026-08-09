@@ -74,7 +74,36 @@ weft jobs list --status running
 
 # AI subtitles: transcribe English audio, translate to Persian
 weft jobs create /data/movie.mp4 --profile ai-subtitle --provider hybrid --src-lang en --lang fa
+
+# Trim the clip before packaging (skip 50s from start, cut 10s off the end)
+weft jobs create /data/movie.mp4 --profile vod-h264 --trim-start 50 --trim-end 10
+
+# Custom thumbnails: exactly 5 evenly-spaced 1080x1080 stills instead of the
+# default poster/sprite set; fetch one back as base64 from the API
+weft jobs create /data/movie.mp4 --profile vod-h264 --thumb-count 5 --thumb-size 1080x1080
+weft jobs get <job_id>            # lists produced assets (thumbnails included)
+weft jobs asset <job_id> thumbnails/<base>_thumb_01.jpg
 ```
+
+#### Trimming and thumbnails
+
+`weft jobs create` accepts four extra flags:
+
+| Flag | Meaning |
+|---|---|
+| `--trim-start <s>` | drop the first N seconds of the clip before HLS packaging (e.g. `50` starts at 50s) |
+| `--trim-end <s>` | cut the last N seconds off the clip (e.g. `10` removes 10s from the end) |
+| `--thumb-count <n>` | replace the default poster/sprite/stills with exactly N evenly-spaced thumbnails |
+| `--thumb-size <w>x<h>\|original` | thumbnail dimensions, e.g. `1080x1080`, or `original` to keep source resolution (only used with `--thumb-count`) |
+
+- Either or both of `--trim-start`/`--trim-end` may be set; both are applied to
+  the `hls` **and** `thumbnail` tasks so the poster stills match the trimmed window.
+- `--thumb-count` requires a profile that runs the `thumbnail` task (e.g.
+  `vod-h264`, `vod-hevc`, `thumbnail`); thumbnails are uploaded to storage and
+  listed under `assets` in `GET /jobs/{id}`.
+- `weft jobs asset <job_id> <name>` returns the file as a base64 data URI via
+  `GET /jobs/{id}/assets/{name}`, so you can fetch a thumbnail without touching
+  the storage server directly.
 
 ---
 

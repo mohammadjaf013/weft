@@ -105,7 +105,13 @@ func (e *Executor) Run(ctx context.Context, task core.Task, in core.TaskInput) (
 	}
 
 	cmd := exec.CommandContext(ctx, e.loc.FFmpeg, argv...)
-	cmd.Stderr = os.Stderr
+	// tee stderr to the task log sink (if any) so operators can inspect the
+	// actual ffmpeg output through the API, not just the final error string.
+	if in.Log != nil {
+		cmd.Stderr = io.MultiWriter(os.Stderr, in.Log)
+	} else {
+		cmd.Stderr = os.Stderr
+	}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

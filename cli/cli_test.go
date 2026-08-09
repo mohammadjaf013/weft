@@ -109,7 +109,7 @@ func TestParseRemotePicksUpAdminKey(t *testing.T) {
 }
 
 func TestJobsCreateBodySrcLang(t *testing.T) {
-	body := jobsCreateBody("/mnt/in.mp4", "ai-subtitle", "high", 2, "fa", "tr", "movie", "series", true, "hybrid")
+	body := jobsCreateBody("/mnt/in.mp4", "ai-subtitle", "high", 2, "fa", "tr", "movie", "series", true, "hybrid", 0, 0, 0, "")
 	want := map[string]any{
 		"input_ref":      "/mnt/in.mp4",
 		"profile":        "ai-subtitle",
@@ -127,7 +127,7 @@ func TestJobsCreateBodySrcLang(t *testing.T) {
 	}
 
 	// empty optional flags must be omitted entirely
-	minimal := jobsCreateBody("in.mp4", "vod-h264", "normal", 0, "", "", "", "", false, "")
+	minimal := jobsCreateBody("in.mp4", "vod-h264", "normal", 0, "", "", "", "", false, "", 0, 0, 0, "")
 	if _, ok := minimal["src_lang"]; ok {
 		t.Errorf("empty src_lang must be omitted: %v", minimal)
 	}
@@ -136,5 +136,14 @@ func TestJobsCreateBodySrcLang(t *testing.T) {
 	}
 	if _, ok := minimal["delete_source"]; ok {
 		t.Errorf("false delete_source must be omitted: %v", minimal)
+	}
+
+	// trim + custom thumbnail params
+	trimmed := jobsCreateBody("in.mp4", "vod-h264", "normal", 0, "", "", "", "", false, "", 50, 10, 5, "1080x1080")
+	if trimmed["trim_start"] != float64(50) || trimmed["trim_end"] != float64(10) {
+		t.Errorf("trim params = %v", trimmed)
+	}
+	if trimmed["thumb_count"] != 5 || trimmed["thumb_size"] != "1080x1080" {
+		t.Errorf("thumb params = %v", trimmed)
 	}
 }

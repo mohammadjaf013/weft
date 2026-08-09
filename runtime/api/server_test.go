@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -510,6 +511,229 @@ func TestRebuildMasterEndpoint(t *testing.T) {
 	}
 	if !strings.Contains(string(b), `SUBTITLES="subs"`) {
 		t.Errorf("master missing subtitle group:\n%s", b)
+	}
+}
+
+func TestDeleteJob(t *testing.T) {
+	srv, _, km := newTestServer(t)
+	raw, _, _ := km.Create("w", []string{"jobs:read", "jobs:write"})
+
+	// create + cancel so the job is in a deletable (terminal) state
+	rr := doRequest(t, srv, "POST", "/jobs", `{"input_ref":"s3://x/movie.mp4","profile":"vod-h264"}`, raw)
+	if rr.Code != 201 {
+		t.Fatalf("create = %d: %s", rr.Code, rr.Body.String())
+	}
+	var created map[string]any
+	json.Unmarshal(rr.Body.Bytes(), &created)
+	id := created["id"].(string)
+	rr = doRequest(t, srv, "POST", "/jobs/"+id+"/cancel", `{}`, raw)
+	if rr.Code != 200 {
+		t.Fatalf("cancel = %d: %s", rr.Code, rr.Body.String())
+	}
+
+	rr = doRequest(t, srv, "DELETE", "/jobs/"+id, "", raw)
+	if rr.Code != 200 {
+		t.Fatalf("delete = %d: %s", rr.Code, rr.Body.String())
+	}
+	rr = doRequest(t, srv, "GET", "/jobs/"+id, "", raw)
+	if rr.Code != 404 {
+		t.Fatalf("get after delete = %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestDeleteActiveJobConflict(t *testing.T) {
+	srv, _, km := newTestServer(t)
+	raw, _, _ := km.Create("w", []string{"jobs:read", "jobs:write"})
+	rr := doRequest(t, srv, "POST", "/jobs", `{"input_ref":"s3://x/movie.mp4","profile":"vod-h264"}`, raw)
+	if rr.Code != 201 {
+		t.Fatalf("create = %d: %s", rr.Code, rr.Body.String())
+	}
+	var created map[string]any
+	json.Unmarshal(rr.Body.Bytes(), &created)
+	id := created["id"].(string)
+
+	// queued job cannot be deleted; cancel first
+	rr = doRequest(t, srv, "DELETE", "/jobs/"+id, "", raw)
+	if rr.Code != 409 || !strings.Contains(rr.Body.String(), "job_active") {
+		t.Fatalf("want job_active 409, got %d %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestTaskLogEndpoint(t *testing.T) {
+	srv, store, km := newTestServer(t)
+	raw, _, _ := km.Create("w", []string{"jobs:read", "jobs:write"})
+	rr := doRequest(t, srv, "POST", "/jobs", `{"input_ref":"s3://x/movie.mp4","profile":"vod-h264"}`, raw)
+	if rr.Code != 201 {
+		t.Fatalf("create = %d: %s", rr.Code, rr.Body.String())
+	}
+	var created map[string]any
+	json.Unmarshal(rr.Body.Bytes(), &created)
+	id := core.JobID(created["id"].(string))
+	tasks, _ := store.ListTasks(context.Background(), id)
+	if len(tasks) == 0 {
+		t.Fatal("no tasks")
+	}
+	taskID := tasks[0].ID
+	if err := store.SaveTaskLog(context.Background(), taskID, id, "ffmpeg stderr tail"); err != nil {
+		t.Fatal(err)
+	}
+
+	rr = doRequest(t, srv, "GET", "/jobs/"+string(id)+"/tasks/"+string(taskID)+"/log", "", raw)
+	if rr.Code != 200 {
+		t.Fatalf("log = %d: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "ffmpeg stderr tail") {
+		t.Fatalf("log body = %s", rr.Body.String())
+	}
+	// missing task → 404
+	rr = doRequest(t, srv, "GET", "/jobs/"+string(id)+"/tasks/nope/log", "", raw)
+	if rr.Code != 404 {
+		t.Fatalf("missing log = %d", rr.Code)
+	}
+}
+
+func TestScaleWorkersEndpoint(t *testing.T) {
+	srv, _, km := newTestServer(t)
+	raw, _, _ := km.Create("w", []string{"workers:write"})
+	rr := doRequest(t, srv, "POST", "/workers/scale", `{"count":0}`, raw)
+	if rr.Code != 501 {
+		t.Fatalf("want 501 when scaler nil, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// with a scaler wired, count validation kicks in first
+	mock := &mockScaler{}
+	srv.scaler = mock
+	rr = doRequest(t, srv, "POST", "/workers/scale", `{"count":0}`, raw)
+	if rr.Code != 400 {
+		t.Fatalf("want 400 for count=0, got %d: %s", rr.Code, rr.Body.String())
+	}
+	rr = doRequest(t, srv, "POST", "/workers/scale", `{"count":4}`, raw)
+	if rr.Code != 200 {
+		t.Fatalf("want 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if mock.count != 4 {
+		t.Fatalf("scaler called with %d, want 4", mock.count)
+	}
+}
+
+type mockScaler struct{ count int }
+
+func (m *mockScaler) Scale(ctx context.Context, count int) error {
+	m.count = count
+	return nil
+}
+
+func TestCreateJobTrimAndThumbParams(t *testing.T) {
+	srv, store, km := newTestServer(t)
+	raw, _, _ := km.Create("w", []string{"jobs:write", "jobs:read"})
+	body := `{"input_ref":"s3://x/movie.mp4","profile":"vod-h264","trim_start":50,"trim_end":10,"thumb_count":5,"thumb_size":"1080x1080"}`
+	rr := doRequest(t, srv, "POST", "/jobs", body, raw)
+	if rr.Code != 201 {
+		t.Fatalf("create = %d: %s", rr.Code, rr.Body.String())
+	}
+	var created map[string]any
+	json.Unmarshal(rr.Body.Bytes(), &created)
+	id := core.JobID(created["id"].(string))
+	tasks, err := store.ListTasks(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tk := range tasks {
+		switch tk.Kind {
+		case "hls", "thumbnail":
+			if tk.Params["trim_start"] != float64(50) {
+				t.Errorf("%s task trim_start = %v, want 50", tk.Kind, tk.Params["trim_start"])
+			}
+			if tk.Params["trim_end"] != float64(10) {
+				t.Errorf("%s task trim_end = %v, want 10", tk.Kind, tk.Params["trim_end"])
+			}
+		}
+		if tk.Kind == "thumbnail" {
+			if tk.Params["thumb_count"] != float64(5) || tk.Params["thumb_size"] != "1080x1080" {
+				t.Errorf("thumbnail params = %v", tk.Params)
+			}
+		}
+	}
+}
+
+func TestGetAssetBase64(t *testing.T) {
+	dir := t.TempDir()
+	srv, store, km := newTestServer(t)
+	srv.stbuild = func(ctx context.Context, destinationID int, destPath string) (core.Storage, error) {
+		return local.New(dir)
+	}
+	raw, _, _ := km.Create("w", []string{"jobs:read"})
+	j := core.Job{ID: "jasset", Status: core.JobCompleted, Priority: core.PriorityNormal, Profile: "vod-h264"}
+	if err := store.SaveJob(context.Background(), j); err != nil {
+		t.Fatal(err)
+	}
+	// asset lives in the storage dir as thumbnails/movie_thumb_01.jpg
+	thumbDir := filepath.Join(dir, "thumbnails")
+	if err := os.MkdirAll(thumbDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("fake-jpeg-bytes")
+	if err := os.WriteFile(filepath.Join(thumbDir, "movie_thumb_01.jpg"), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveTaskOutputs(context.Background(), "task1", "jasset", []core.AssetRef{
+		{Kind: "thumbnail", Name: "movie_thumb_01.jpg", URI: "local:thumbnails/movie_thumb_01.jpg", Dir: "thumbnails"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rr := doRequest(t, srv, "GET", "/jobs/jasset/assets/movie_thumb_01.jpg", "", raw)
+	if rr.Code != 200 {
+		t.Fatalf("asset = %d: %s", rr.Code, rr.Body.String())
+	}
+	var out struct {
+		Name string `json:"name"`
+		Mime string `json:"mime"`
+		Data string `json:"data"`
+	}
+	json.Unmarshal(rr.Body.Bytes(), &out)
+	if out.Name != "movie_thumb_01.jpg" {
+		t.Errorf("name = %q", out.Name)
+	}
+	if out.Mime != "image/jpeg" {
+		t.Errorf("mime = %q, want image/jpeg", out.Mime)
+	}
+	want := base64.StdEncoding.EncodeToString(content)
+	if out.Data != want {
+		t.Errorf("data mismatch")
+	}
+	// unknown asset -> 404
+	rr = doRequest(t, srv, "GET", "/jobs/jasset/assets/nope.jpg", "", raw)
+	if rr.Code != 404 {
+		t.Fatalf("missing asset = %d", rr.Code)
+	}
+}
+
+func TestGetJobIncludesAssets(t *testing.T) {
+	srv, store, km := newTestServer(t)
+	raw, _, _ := km.Create("w", []string{"jobs:read"})
+	j := core.Job{ID: "jassets2", Status: core.JobCompleted, Priority: core.PriorityNormal, Profile: "vod-h264"}
+	if err := store.SaveJob(context.Background(), j); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveTaskOutputs(context.Background(), "task1", "jassets2", []core.AssetRef{
+		{Kind: "thumbnail", Name: "movie_poster.jpg", URI: "local:thumbnails/movie_poster.jpg", Dir: "thumbnails", Bytes: 42},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rr := doRequest(t, srv, "GET", "/jobs/jassets2", "", raw)
+	if rr.Code != 200 {
+		t.Fatalf("get = %d", rr.Code)
+	}
+	var out struct {
+		Assets []map[string]any `json:"assets"`
+	}
+	json.Unmarshal(rr.Body.Bytes(), &out)
+	if len(out.Assets) != 1 || out.Assets[0]["name"] != "movie_poster.jpg" {
+		t.Fatalf("assets = %v", out.Assets)
+	}
+	if out.Assets[0]["bytes"] != float64(42) {
+		t.Fatalf("asset bytes = %v", out.Assets[0]["bytes"])
 	}
 }
 

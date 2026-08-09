@@ -21,6 +21,10 @@ type TaskInput struct {
 	// Executor is injected so plugins can run ffmpeg/ffprobe without importing
 	// Runtime. A plugin builds argv into Params["argv"] and calls Executor.Run.
 	Executor Executor
+	// Log is an optional sink for the raw process stderr of this task. Plugins
+	// and executors tee their command output here so operators can inspect what
+	// actually ran (ffmpeg/whisper diagnostics) via the API. nil = discard.
+	Log io.Writer
 }
 
 // TaskOutput is what a plugin returns.
@@ -80,6 +84,11 @@ type Store interface {
 	// worker's progress callback so frequent progress updates never clobber
 	// the reservation metadata (which would break crash recovery).
 	UpdateTaskProgress(ctx context.Context, id TaskID, status TaskStatus, progress float64) error
+	// TryLease atomically claims a pending/ready task for a worker. It returns
+	// true only when this worker won the claim; false when another worker beat
+	// it (both workers observed the task as runnable in NextReady). Needed to
+	// run more than one worker without double-processing a task.
+	TryLease(ctx context.Context, t Task, workerID string, leaseExpiresAt, startedAt time.Time) (bool, error)
 	AppendEvent(ctx context.Context, e Event) error // same tx as SaveJob/SaveTask in Runtime impl
 	ListEvents(ctx context.Context, jobID JobID) ([]Event, error)
 	Outbox() OutboxStore

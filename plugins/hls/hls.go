@@ -51,8 +51,9 @@ func (p *Plugin) Process(ctx context.Context, in core.TaskInput) (core.TaskOutpu
 	// Audio-only input (mp3 and friends) → audio HLS; otherwise a full
 	// multi-rendition video HLS set.
 	hasAudio := mediautil.HasAudio(in)
+	trim := mediautil.TrimFromParams(in.Params, mediautil.Duration(in))
 	if isAudioOnly(in) {
-		in.Params["argv"] = mediautil.AudioHLSArgs(in.InputURI, outDir, base, 6, "")
+		in.Params["argv"] = mediautil.AudioHLSArgs(in.InputURI, outDir, base, 6, "", trim)
 	} else {
 		ladder := mediautil.DefaultH264Ladder
 		if l, ok := in.Params["ladder"].([]string); ok && len(l) > 0 {
@@ -63,7 +64,7 @@ func (p *Plugin) Process(ctx context.Context, in core.TaskInput) (core.TaskOutpu
 			codec = "hevc"
 		}
 		// single-pass: decode once, write every rendition + a master playlist
-		in.Params["argv"] = mediautil.HLSMultiArgsCodec(in.InputURI, ladder, outDir, base, 6, hasAudio, codec)
+		in.Params["argv"] = mediautil.HLSMultiArgsCodec(in.InputURI, ladder, outDir, base, 6, hasAudio, codec, trim)
 		frameRate := mediautil.FrameRate(in)
 		if err := mediautil.WriteFile(filepath.Join(outDir, "playlist.m3u8"), mediautil.MasterPlaylistCodec(ladder, frameRate, codec)); err != nil {
 			return core.TaskOutput{}, err

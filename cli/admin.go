@@ -374,6 +374,12 @@ func cmdQueue(args []string) error {
 }
 
 func cmdWorkers(args []string) error {
+	if len(args) > 0 {
+		switch args[0] {
+		case "scale":
+			return workersScale(args[1:])
+		}
+	}
 	fs := remoteFlagSet("workers")
 	rf, err := parseRemote(fs, args)
 	if err != nil {
@@ -395,6 +401,32 @@ func cmdWorkers(args []string) error {
 		w.row(wk.ID, wk.Status, wk.CurrentTaskID)
 	}
 	w.print()
+	return nil
+}
+
+// workersScale resizes the worker pool at runtime without a daemon restart.
+func workersScale(args []string) error {
+	fs := remoteFlagSet("workers scale")
+	rf, err := parseRemote(fs, args)
+	if err != nil {
+		return err
+	}
+	pos := fs.Args()
+	if len(pos) == 0 {
+		return fmt.Errorf("workers scale: <count> argument is required")
+	}
+	var n int
+	if _, err := fmt.Sscanf(pos[0], "%d", &n); err != nil || n < 1 {
+		return fmt.Errorf("workers scale: count must be an integer >= 1")
+	}
+	c := newClient(rf)
+	var out struct {
+		Workers int `json:"workers"`
+	}
+	if err := c.post("/workers/scale", map[string]any{"count": n}, &out); err != nil {
+		return err
+	}
+	fmt.Printf("worker pool scaled to %d\n", out.Workers)
 	return nil
 }
 

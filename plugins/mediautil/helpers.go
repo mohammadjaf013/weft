@@ -2,6 +2,7 @@ package mediautil
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -105,4 +106,43 @@ func Glob(dir, pattern string) []string {
 		return nil
 	}
 	return matches
+}
+
+// ParamFloat reads a float64 param by name, returning def when absent or
+// unparsable.
+func ParamFloat(params map[string]any, name string, def float64) float64 {
+	v, ok := params[name]
+	if !ok {
+		return def
+	}
+	switch n := v.(type) {
+	case float64:
+		return n
+	case int:
+		return float64(n)
+	case json.Number:
+		f, err := n.Float64()
+		if err != nil {
+			return def
+		}
+		return f
+	}
+	return def
+}
+
+// TrimFromParams derives a Trim from "trim_start"/"trim_end" task params.
+// trim_start skips that many seconds from the beginning; trim_end keeps the
+// clip but cuts that many seconds off the end (requires the probed duration).
+// Returns zero Trim when neither param is set.
+func TrimFromParams(params map[string]any, duration float64) Trim {
+	start := ParamFloat(params, "trim_start", 0)
+	end := ParamFloat(params, "trim_end", 0)
+	if start <= 0 && end <= 0 {
+		return Trim{}
+	}
+	keep := duration - start - end
+	if keep <= 0 {
+		return Trim{Start: start, Keep: 0}
+	}
+	return Trim{Start: start, Keep: keep}
 }

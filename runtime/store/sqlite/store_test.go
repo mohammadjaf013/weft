@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/mohammadjaf013/weft/core"
 )
@@ -240,5 +241,140 @@ func TestStoreWebhookAndKeys(t *testing.T) {
 	servers, _ := store.ListStorageServers(ctx)
 	if len(servers) != 1 || servers[0].Config["path"] != "/srv" {
 		t.Fatalf("servers = %v", servers)
+	}
+}
+
+func TestStoreTryLease(t *testing.T) {
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	task := core.Task{ID: "t1", JobID: "j1", Kind: "video_encode", Status: core.TaskReady}
+	if err := store.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	exp := core.Now().Add(time.Minute)
+	claimed, err := store.TryLease(ctx, task, "w1", exp, core.Now())
+	if err != nil || !claimed {
+		t.Fatalf("first lease = %v, %v; want true", claimed, err)
+	}
+	// second worker must not claim the same task
+	claimed, _ = store.TryLease(ctx, task, "w2", exp, core.Now())
+	if claimed {
+		t.Fatalf("second lease succeeded; want false")
+	}
+	got, _ := store.LoadTask(ctx, "t1")
+	if got.Status != core.TaskLeased || got.WorkerID != "w1" {
+		t.Fatalf("task after lease = %+v", got)
+	}
+}
+
+func TestStoreDeleteJobCascade(t *testing.T) {
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	j := core.Job{ID: "jdel", Status: core.JobCompleted, Priority: core.PriorityNormal, Profile: "vod"}
+	if err := store.SaveJob(ctx, j); err != nil {
+		t.Fatal(err)
+	}
+	task := core.Task{ID: "tdel", JobID: "jdel", Kind: "video_encode", Status: core.TaskDone}
+	if err := store.SaveTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveTaskOutputs(ctx, "tdel", "jdel", []core.AssetRef{{Kind: "video", Name: "v.mp4", URI: "/x/v.mp4", Bytes: 10}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveTaskLog(ctx, "tdel", "jdel", "ffmpeg ok"); err != nil {
+		t.Fatal(err)
+	}
+	ev := core.Event{ID: "edel", JobID: "jdel", Kind: core.EvtJobCreated, CreatedAt: core.Now()}
+	if err := store.AppendEvent(ctx, ev); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.DeleteJob(ctx, "jdel"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.LoadJob(ctx, "jdel"); !errors.Is(err, core.ErrJobNotFound) {
+		t.Fatalf("job still present: %v", err)
+	}
+	if _, err := store.LoadTask(ctx, "tdel"); err == nil {
+		t.Fatal("task still present")
+	}
+	if evs, _ := store.ListEvents(ctx, "jdel"); len(evs) != 0 {
+		t.Fatalf("events = %v", evs)
+	}
+	if outs, _ := store.ListJobOutputs(ctx, "jdel"); len(outs) != 0 {
+		t.Fatalf("outputs = %v", outs)
+	}
+	if log, _ := store.LoadTaskLog(ctx, "tdel"); log != "" {
+		t.Fatalf("log = %q", log)
+	}
+}
+
+func TestStoreTaskLogRoundTrip(t *testing.T) {
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.SaveTaskLog(ctx, "tlog", "j1", "whisper progress..."); err != nil {
+		t.Fatal(err)
+	}
+	log, err := store.LoadTaskLog(ctx, "tlog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if log != "whisper progress..." {
+		t.Fatalf("log = %q", log)
+	}
+	// overwrite
+	if err := store.SaveTaskLog(ctx, "tlog", "j1", "new"); err != nil {
+		t.Fatal(err)
+	}
+	log, _ = store.LoadTaskLog(ctx, "tlog")
+	if log != "new" {
+		t.Fatalf("log after overwrite = %q", log)
+	}
+	// missing
+	if log, _ := store.LoadTaskLog(ctx, "nope"); log != "" {
+		t.Fatalf("missing log = %q", log)
+	}
+}
+
+func TestStorePruneEvents(t *testing.T) {
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	old := core.Event{ID: "eold", JobID: "j1", Kind: core.EvtJobStarted, CreatedAt: core.Now().Add(-48 * time.Hour)}
+	newer := core.Event{ID: "enew", JobID: "j2", Kind: core.EvtJobStarted, CreatedAt: core.Now()}
+	if err := store.AppendEvent(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendEvent(ctx, newer); err != nil {
+		t.Fatal(err)
+	}
+	n, err := store.PruneEvents(ctx, core.Now().Add(-24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("pruned %d, want 1", n)
+	}
+	evs, _ := store.ListEvents(ctx, "")
+	if len(evs) != 1 || evs[0].ID != "enew" {
+		t.Fatalf("remaining events = %v", evs)
 	}
 }

@@ -70,11 +70,28 @@ func (d *Daemon) Serve(ctx context.Context) error {
 		expirer(ctx, d.store, 2*time.Second)
 	}()
 
+	// event retention: periodically delete events older than the configured
+	// retention window so the event log (and webhook outbox) never grows
+	// without bound. cron.cleanup.event_retention_days; 0 disables.
+	if days := d.cfg.Cron.Cleanup.EventRetentionDays; days > 0 {
+		d.wg.Add(1)
+		go func() {
+			defer d.wg.Done()
+			retentionPruner(ctx, d.store, days, time.Hour)
+		}()
+	}
+
 	// workers. A resource gate idles workers when the host exceeds the
 	// scheduler thresholds, so the queue stays put instead of saturating CPU.
+	// workers.max caps how many tasks run at once (spawn that many workers);
+	// when unset, workers.min is the steady-state pool size.
 	min := d.cfg.Workers.Min
 	if min <= 0 {
 		min = 1
+	}
+	count := min
+	if d.cfg.Workers.Max > 0 && d.cfg.Workers.Max >= min {
+		count = d.cfg.Workers.Max
 	}
 	leaseTTL := 5 * time.Minute
 	if d.cfg.Workers.LeaseTTLSeconds > 0 {
@@ -91,28 +108,22 @@ func (d *Daemon) Serve(ctx context.Context) error {
 	if gate != nil {
 		gateAllow = gate.Allow
 	}
-	for i := 0; i < min; i++ {
-		w := worker.New(fmt.Sprintf("w%d", i), worker.Options{
-			Store:         d.store,
-			Bus:           d.bus,
-			Sched:         d.sched,
-			SM:            d.sm,
-			Registry:      d.reg,
-			Executor:      d.exec,
-			Storage:       d.storageFor,
-			OutputStore:   d.store,
-			LeaseTTL:      leaseTTL,
-			InputResolver: d.resolveInputOr,
-			Gate:          gateAllow,
-		})
-		d.pool.add(w)
-		d.wg.Add(1)
-		go func(ww *worker.Worker) {
-			defer d.wg.Done()
-			if err := ww.Run(ctx); err != nil {
-				log.Printf("worker %s stopped: %v", ww.ID(), err)
-			}
-		}(w)
+	// the pool owns the worker goroutines so it can be scaled at runtime
+	d.pool.setOptions(worker.Options{
+		Store:         d.store,
+		Bus:           d.bus,
+		Sched:         d.sched,
+		SM:            d.sm,
+		Registry:      d.reg,
+		Executor:      d.exec,
+		Storage:       d.storageFor,
+		OutputStore:   d.store,
+		LeaseTTL:      leaseTTL,
+		InputResolver: d.resolveInputOr,
+		Gate:          gateAllow,
+	})
+	if err := d.pool.Scale(ctx, count); err != nil {
+		return err
 	}
 
 	// metrics bus subscription
@@ -160,6 +171,9 @@ func (d *Daemon) Serve(ctx context.Context) error {
 	defer cancel()
 	_ = d.httpSrv.Shutdown(shutCtx)
 	d.wg.Wait()
+	if d.pool != nil {
+		d.pool.Wait()
+	}
 	return nil
 }
 
@@ -345,6 +359,30 @@ func expirer(ctx context.Context, store *sqlite.Store, interval time.Duration) {
 			}
 			if len(ids) > 0 {
 				log.Printf("lease expirer requeued %d expired tasks", len(ids))
+			}
+		}
+	}
+}
+
+// retentionPruner periodically deletes events (and their outbox rows) older
+// than retentionDays so the event log doesn't grow without bound. Best effort:
+// a failed prune is logged and retried next tick.
+func retentionPruner(ctx context.Context, store *sqlite.Store, retentionDays int, interval time.Duration) {
+	tick := time.NewTicker(interval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			cutoff := core.Now().Add(-time.Duration(retentionDays) * 24 * time.Hour)
+			n, err := store.PruneEvents(ctx, cutoff)
+			if err != nil {
+				log.Printf("event retention: %v", err)
+				continue
+			}
+			if n > 0 {
+				log.Printf("event retention pruned %d events older than %d days", n, retentionDays)
 			}
 		}
 	}

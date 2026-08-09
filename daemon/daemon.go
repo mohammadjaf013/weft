@@ -113,10 +113,10 @@ func Open(c *cfg.Config, store *sqlite.Store, opts ...Options) (*Daemon, error) 
 	adminKey := c.Security.AdminAPIKey
 	km := api.NewKeyManager(store, adminKey)
 
-	pool := newWorkerPool()
 	d := &Daemon{
 		cfg: c, store: store, bus: bus, sched: sched, sm: sm,
-		reg: reg, exec: exec, metric: m, km: km, pool: pool,
+		reg: reg, exec: exec, metric: m, km: km,
+		pool: newWorkerPool(worker.Options{}),
 		inputResolver: o.InputResolver,
 	}
 
@@ -130,7 +130,8 @@ func Open(c *cfg.Config, store *sqlite.Store, opts ...Options) (*Daemon, error) 
 		Metrics:  m,
 		Config:   c,
 		Keys:     km,
-		Worker:   pool,
+		Worker:   d.pool,
+		WorkerScaler: d.pool,
 		Storage:  d.storageForID,
 	})
 	return d, nil

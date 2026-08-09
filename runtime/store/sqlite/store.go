@@ -166,6 +166,14 @@ CREATE TABLE IF NOT EXISTS benchmarks (
     estimated_capacity    REAL,
     created_at            TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS task_logs (
+    task_id      TEXT PRIMARY KEY,
+    job_id       TEXT NOT NULL,
+    log          TEXT NOT NULL DEFAULT '',
+    updated_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_task_logs_job ON task_logs(job_id);
 `
 	_, err := db.Exec(schema)
 	if err != nil {
@@ -338,6 +346,22 @@ func (s *Store) ListJobs(ctx context.Context, filter core.JobFilter) ([]core.Job
 
 func (s *Store) SaveTask(ctx context.Context, t core.Task) error {
 	return s.SaveTaskEvent(ctx, t, core.Event{})
+}
+
+// TryLease atomically claims a task for a worker. It only succeeds when the
+// task is still pending or ready, which prevents two workers from picking up
+// the same task when worker count > 1. Returns (true, nil) when this worker
+// won the claim, (false, nil) when another worker already took it.
+func (s *Store) TryLease(ctx context.Context, task core.Task, workerID string, leaseExpiresAt time.Time, startedAt time.Time) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `UPDATE tasks SET status=?, worker_id=?, lease_expires_at=?, started_at=?
+		WHERE id=? AND status IN (?,?)`,
+		core.TaskLeased, workerID, ts(leaseExpiresAt), ts(startedAt),
+		task.ID, core.TaskPending, core.TaskReady)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n == 1, nil
 }
 
 // UpdateTaskProgress writes only status + progress_percent for a task. It must
@@ -618,4 +642,88 @@ func (s *Store) RequeueExpired(ctx context.Context, now time.Time) ([]core.TaskI
 		}
 	}
 	return ids, nil
+}
+
+// DeleteJob removes a job and everything that belongs to it in one transaction:
+// its tasks, task outputs, events, task logs, and any undelivered webhook
+// outbox rows referencing those events. This is the production escape hatch for
+// clearing finished/failed/cancelled jobs so the database never grows forever.
+func (s *Store) DeleteJob(ctx context.Context, id core.JobID) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// outbox rows reference event ids; drop the ones for this job's events so a
+	// pending webhook delivery doesn't try to load a deleted event body.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM outbox WHERE event_id IN (SELECT id FROM events WHERE job_id=?)`, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM events WHERE job_id=?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM task_outputs WHERE job_id=?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM task_logs WHERE job_id=?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM tasks WHERE job_id=?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM jobs WHERE id=?`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// SaveTaskLog persists the execution log of a task (ffmpeg/whisper stderr tail).
+// Used by the worker so operators can inspect why a task failed or what a plugin
+// emitted, without needing shell access to the node.
+func (s *Store) SaveTaskLog(ctx context.Context, taskID core.TaskID, jobID core.JobID, log string) error {
+	if len(log) > 256*1024 {
+		log = log[len(log)-256*1024:]
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO task_logs(task_id,job_id,log,updated_at)
+		VALUES(?,?,?,?)
+		ON CONFLICT(task_id) DO UPDATE SET log=excluded.log, updated_at=excluded.updated_at`,
+		taskID, jobID, log, ts(core.Now()))
+	return err
+}
+
+// LoadTaskLog returns the saved execution log for a task, or "" when none.
+func (s *Store) LoadTaskLog(ctx context.Context, taskID core.TaskID) (string, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT log FROM task_logs WHERE task_id=?`, taskID)
+	var log string
+	err := row.Scan(&log)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return log, nil
+}
+
+// PruneEvents deletes events older than the given cutoff (event retention), and
+// the webhook outbox rows that referenced them. Returns the number of rows
+// removed. 0 disables pruning (the caller skips the call).
+func (s *Store) PruneEvents(ctx context.Context, olderThan time.Time) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	cutoff := ts(olderThan)
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM outbox WHERE event_id IN (SELECT id FROM events WHERE created_at < ?)`, cutoff); err != nil {
+		return 0, err
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM events WHERE created_at < ?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, tx.Commit()
 }

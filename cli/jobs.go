@@ -5,10 +5,10 @@ import (
 	"fmt"
 )
 
-// cmdJobs handles `weft jobs ...`: list, get, create, events, and action.
+// cmdJobs handles `weft jobs ...`: list, get, create, events, log, asset, delete, action.
 func cmdJobs(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("jobs: missing subcommand (list|get|create|events|action)")
+		return fmt.Errorf("jobs: missing subcommand (list|get|create|events|log|asset|delete|action)")
 	}
 	sub := args[0]
 	rest := args[1:]
@@ -21,10 +21,16 @@ func cmdJobs(args []string) error {
 		return jobsCreate(rest)
 	case "events":
 		return jobsEvents(rest)
+	case "log":
+		return jobsLog(rest)
+	case "asset":
+		return jobsAsset(rest)
+	case "delete":
+		return jobsDelete(rest)
 	case "action":
 		return jobsAction(rest)
 	default:
-		return fmt.Errorf("jobs: unknown subcommand %q (list|get|create|events|action)", sub)
+		return fmt.Errorf("jobs: unknown subcommand %q (list|get|create|events|log|asset|delete|action)", sub)
 	}
 }
 
@@ -114,6 +120,12 @@ func jobsGet(args []string) error {
 			Progress float64 `json:"progress_percent"`
 			Error    string  `json:"error,omitempty"`
 		} `json:"tasks"`
+		Assets []struct {
+			Kind  string `json:"kind"`
+			Name  string `json:"name"`
+			URI   string `json:"uri"`
+			Bytes int64  `json:"bytes"`
+		} `json:"assets"`
 	}
 	if err := c.get("/jobs/"+pos[0], &out); err != nil {
 		return err
@@ -130,6 +142,13 @@ func jobsGet(args []string) error {
 		w.row(t.ID, t.Kind, t.Status, fmt.Sprintf("%.1f%%", t.Progress), t.Error)
 	}
 	w.print()
+	if len(out.Assets) > 0 {
+		aw := newTable("KIND", "NAME", "URI")
+		for _, a := range out.Assets {
+			aw.row(a.Kind, a.Name, a.URI)
+		}
+		aw.print()
+	}
 	return nil
 }
 
@@ -144,6 +163,10 @@ func jobsCreate(args []string) error {
 	path := fs.String("path", "", "subdirectory under the destination storage root, e.g. movie or series")
 	deleteSource := fs.Bool("delete-source", false, "delete the source input file after the job completes")
 	provider := fs.String("provider", "", "ai-subtitle provider: whisper | gemini | hybrid (empty = server default)")
+	trimStart := fs.Float64("trim-start", 0, "skip N seconds from the beginning of the clip before HLS packaging")
+	trimEnd := fs.Float64("trim-end", 0, "cut N seconds off the end of the clip before HLS packaging")
+	thumbCount := fs.Int("thumb-count", 0, "produce exactly N evenly-spaced thumbnails instead of poster/sprite/stills")
+	thumbSize := fs.String("thumb-size", "", "custom thumbnail size: 1080x1080 or original (requires --thumb-count)")
 	rf, err := parseRemote(fs, args)
 	if err != nil {
 		return err
@@ -161,7 +184,7 @@ func jobsCreate(args []string) error {
 		Status string   `json:"status"`
 		Tasks  []string `json:"tasks"`
 	}
-	body := jobsCreateBody(pos[0], *profile, *priority, *dest, *lang, *srcLang, *name, *path, *deleteSource, *provider)
+	body := jobsCreateBody(pos[0], *profile, *priority, *dest, *lang, *srcLang, *name, *path, *deleteSource, *provider, *trimStart, *trimEnd, *thumbCount, *thumbSize)
 	err = c.post("/jobs", body, &out)
 	if err != nil {
 		return err
@@ -175,7 +198,7 @@ func jobsCreate(args []string) error {
 
 // jobsCreateBody builds the /jobs payload from CLI flags (separate so the flag
 // plumbing is unit-testable without an HTTP round trip).
-func jobsCreateBody(inputRef, profile, priority string, dest int, lang, srcLang, name, path string, deleteSource bool, provider string) map[string]any {
+func jobsCreateBody(inputRef, profile, priority string, dest int, lang, srcLang, name, path string, deleteSource bool, provider string, trimStart, trimEnd float64, thumbCount int, thumbSize string) map[string]any {
 	body := map[string]any{
 		"input_ref":      inputRef,
 		"profile":        profile,
@@ -200,7 +223,46 @@ func jobsCreateBody(inputRef, profile, priority string, dest int, lang, srcLang,
 	if provider != "" {
 		body["provider"] = provider
 	}
+	if trimStart > 0 {
+		body["trim_start"] = trimStart
+	}
+	if trimEnd > 0 {
+		body["trim_end"] = trimEnd
+	}
+	if thumbCount > 0 {
+		body["thumb_count"] = thumbCount
+		if thumbSize != "" {
+			body["thumb_size"] = thumbSize
+		}
+	}
 	return body
+}
+
+// jobsAsset fetches a produced asset (e.g. a thumbnail) of a finished job and
+// prints it as a base64 data URI. A job's assets are listed by `jobs get`.
+func jobsAsset(args []string) error {
+	fs := remoteFlagSet("jobs asset")
+	rf, err := parseRemote(fs, args)
+	if err != nil {
+		return err
+	}
+	pos := fs.Args()
+	if len(pos) < 2 {
+		return fmt.Errorf("jobs asset: <job id> <asset name> required")
+	}
+	c := newClient(rf)
+	var out struct {
+		Name string `json:"name"`
+		URI  string `json:"uri"`
+		Mime string `json:"mime"`
+		Data string `json:"data"`
+	}
+	if err := c.get("/jobs/"+pos[0]+"/assets/"+pos[1], &out); err != nil {
+		return err
+	}
+	fmt.Printf("asset %s  uri=%s  mime=%s\n", out.Name, out.URI, out.Mime)
+	fmt.Printf("data:%s;base64,%s\n", out.Mime, out.Data)
+	return nil
 }
 
 func jobsEvents(args []string) error {
@@ -258,5 +320,55 @@ func jobsAction(args []string) error {
 		return err
 	}
 	fmt.Printf("job %s -> %s\n", out.ID, out.Status)
+	return nil
+}
+
+// jobsLog prints the saved execution log (ffmpeg/whisper stderr) of a task.
+func jobsLog(args []string) error {
+	fs := remoteFlagSet("jobs log")
+	rf, err := parseRemote(fs, args)
+	if err != nil {
+		return err
+	}
+	pos := fs.Args()
+	if len(pos) < 2 {
+		return fmt.Errorf("jobs log: <job id> <task id> required")
+	}
+	c := newClient(rf)
+	var out struct {
+		TaskID string `json:"task_id"`
+		Log    string `json:"log"`
+	}
+	if err := c.get("/jobs/"+pos[0]+"/tasks/"+pos[1]+"/log", &out); err != nil {
+		return err
+	}
+	if out.Log == "" {
+		fmt.Println("(no log captured for this task)")
+		return nil
+	}
+	fmt.Print(out.Log)
+	return nil
+}
+
+// jobsDelete removes a finished job and all of its data from the server.
+func jobsDelete(args []string) error {
+	fs := remoteFlagSet("jobs delete")
+	rf, err := parseRemote(fs, args)
+	if err != nil {
+		return err
+	}
+	pos := fs.Args()
+	if len(pos) == 0 {
+		return fmt.Errorf("jobs delete: job id argument is required")
+	}
+	c := newClient(rf)
+	var out struct {
+		ID     string `json:"id"`
+		Status string `json:"status"`
+	}
+	if err := c.del("/jobs/"+pos[0], &out); err != nil {
+		return err
+	}
+	fmt.Printf("job %s deleted\n", out.ID)
 	return nil
 }

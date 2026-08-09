@@ -4,10 +4,13 @@ package api
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -34,6 +37,7 @@ type Server struct {
 	cfg      *cfg.Config
 	keys     *KeyManager
 	worker   WorkerHandle
+	scaler   WorkerScaler
 	stbuild  StorageBuilder
 }
 
@@ -45,6 +49,12 @@ type StorageBuilder func(ctx context.Context, destinationID int, destPath string
 // WorkerHandle lets the API report current worker state to /workers.
 type WorkerHandle interface {
 	Snapshot() []WorkerState
+}
+
+// WorkerScaler lets the API scale the worker pool at runtime. Implemented by
+// the daemon's worker pool; nil means the endpoint is disabled.
+type WorkerScaler interface {
+	Scale(ctx context.Context, target int) error
 }
 
 type WorkerState struct {
@@ -64,6 +74,8 @@ type Options struct {
 	Config   *cfg.Config
 	Keys     *KeyManager
 	Worker   WorkerHandle
+	// WorkerScaler, when non-nil, enables POST /workers/scale (pool sizing).
+	WorkerScaler WorkerScaler
 	// Storage builds destination storage for a server id / subdir (nil ⇒ no
 	// storage-admin endpoints such as rebuild-master).
 	Storage StorageBuilder
@@ -80,6 +92,7 @@ func NewServer(o Options) *Server {
 		cfg:      o.Config,
 		keys:     o.Keys,
 		worker:   o.Worker,
+		scaler:   o.WorkerScaler,
 		stbuild:  o.Storage,
 	}
 }
@@ -98,10 +111,14 @@ func (s *Server) Router() http.Handler {
 		pr.Post("/jobs", s.handleCreateJob)               // jobs:write
 		pr.Get("/jobs/{id}", s.handleGetJob)              // jobs:read
 		pr.Get("/jobs/{id}/events", s.handleJobEvents)    // jobs:read
+		pr.Get("/jobs/{id}/tasks/{taskID}/log", s.handleTaskLog) // jobs:read
+		pr.Get("/jobs/{id}/assets/{name}", s.handleGetAsset) // jobs:read
+		pr.Delete("/jobs/{id}", s.handleDeleteJob)        // jobs:write
 		pr.Post("/jobs/{id}/{action}", s.handleJobAction) // jobs:write
 
 		pr.Get("/queue", s.handleQueue)     // queue:read
 		pr.Get("/workers", s.handleWorkers) // workers:read
+		pr.Post("/workers/scale", s.handleScaleWorkers) // workers:write
 
 		pr.Get("/storage/servers", s.handleListServers) // storage:manage
 		pr.Post("/storage/servers", s.handleAddServer)  // storage:manage
@@ -232,10 +249,14 @@ func (s *Server) scopeAllowed(scopes []string, r *http.Request) bool {
 		return has("jobs:read")
 	case strings.HasPrefix(path, "/jobs/") && method == http.MethodPost:
 		return has("jobs:write")
+	case strings.HasPrefix(path, "/jobs/") && method == http.MethodDelete:
+		return has("jobs:write")
 	case path == "/queue":
 		return has("queue:read")
 	case path == "/workers":
 		return has("workers:read")
+	case path == "/workers/scale":
+		return has("workers:write")
 	case strings.HasPrefix(path, "/storage/"):
 		return has("storage:manage")
 	case strings.HasPrefix(path, "/webhooks"):
@@ -274,6 +295,18 @@ type createJobRequest struct {
 	// Provider selects the ai-subtitle provider for this job: whisper | gemini |
 	// hybrid (empty = server default).
 	Provider string `json:"provider"`
+	// TrimStart skips this many seconds from the beginning of the clip before
+	// HLS packaging (0 = from the very start).
+	TrimStart float64 `json:"trim_start"`
+	// TrimEnd cuts this many seconds off the end of the clip (0 = keep to the
+	// very end). Applied with TrimStart; either or both may be set.
+	TrimEnd float64 `json:"trim_end"`
+	// ThumbCount, when > 0, replaces the default poster/sprite/stills with
+	// exactly this many evenly-spaced thumbnails.
+	ThumbCount float64 `json:"thumb_count"`
+	// ThumbSize selects the custom thumbnail dimensions: "1080x1080" or
+	// "original" (keep source resolution). Ignored unless thumb_count is set.
+	ThumbSize string `json:"thumb_size"`
 }
 
 func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
@@ -337,7 +370,7 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		DeleteSource:  req.DeleteSource,
 	}
 
-	tasks, err := s.buildTasks(r.Context(), prof, jobID, req.Lang, req.Name, req.Provider, req.SrcLang)
+	tasks, err := s.buildTasks(r.Context(), prof, jobID, req.Lang, req.Name, req.Provider, req.SrcLang, req.TrimStart, req.TrimEnd, req.ThumbCount, req.ThumbSize)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
@@ -364,8 +397,11 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 // is attached to every subtitle task so the plugin can name its output dir.
 // Provider (whisper|gemini|hybrid) overrides the ai-subtitle provider for jobs
 // that need a different engine than the server default. srcLang is the spoken
-// audio language; it drives whisper's -l and hybrid translation.
-func (s *Server) buildTasks(ctx context.Context, p profiles.Profile, jobID core.JobID, lang, name, provider, srcLang string) ([]core.Task, error) {
+// audio language; it drives whisper's -l and hybrid translation. trimStart /
+// trimEnd reach the hls and thumbnail tasks so the renditions and the poster
+// thumbnails come from the same window; thumbCount/thumbSize switch the
+// thumbnail task into the custom N-thumbnails mode.
+func (s *Server) buildTasks(ctx context.Context, p profiles.Profile, jobID core.JobID, lang, name, provider, srcLang string, trimStart, trimEnd, thumbCount float64, thumbSize string) ([]core.Task, error) {
 	tasks, err := p.BuildTaskGraph(jobID)
 	if err != nil {
 		return nil, err
@@ -385,6 +421,39 @@ func (s *Server) buildTasks(ctx context.Context, p profiles.Profile, jobID core.
 		}
 		if name != "" {
 			tasks[i].Params["name"] = name
+		}
+	}
+	// trim window: applies to hls (the packager) and thumbnail (so the poster
+	// stills match the trimmed renditions).
+	if trimStart > 0 || trimEnd > 0 {
+		for i := range tasks {
+			if tasks[i].Kind != "hls" && tasks[i].Kind != "thumbnail" {
+				continue
+			}
+			if tasks[i].Params == nil {
+				tasks[i].Params = map[string]any{}
+			}
+			if trimStart > 0 {
+				tasks[i].Params["trim_start"] = trimStart
+			}
+			if trimEnd > 0 {
+				tasks[i].Params["trim_end"] = trimEnd
+			}
+		}
+	}
+	// custom thumbnail mode: only meaningful for the thumbnail task
+	if thumbCount > 0 {
+		for i := range tasks {
+			if tasks[i].Kind != "thumbnail" {
+				continue
+			}
+			if tasks[i].Params == nil {
+				tasks[i].Params = map[string]any{}
+			}
+			tasks[i].Params["thumb_count"] = thumbCount
+			if thumbSize != "" {
+				tasks[i].Params["thumb_size"] = thumbSize
+			}
 		}
 	}
 	if provider != "" {
@@ -514,6 +583,17 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 	if totalWeight > 0 {
 		op = overall / totalWeight
 	}
+	outputs, _ := s.store.ListJobOutputs(r.Context(), id)
+	assetDTOs := make([]map[string]any, 0, len(outputs))
+	for _, a := range outputs {
+		assetDTOs = append(assetDTOs, map[string]any{
+			"kind": a.Kind,
+			"name": a.Name,
+			"uri":  a.URI,
+			"dir":  a.Dir,
+			"bytes": a.Bytes,
+		})
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id":               job.ID,
 		"status":           job.Status,
@@ -525,6 +605,7 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 		"overall_progress": op,
 		"error":            job.Error,
 		"tasks":            dtos,
+		"assets":           assetDTOs,
 	})
 }
 
@@ -621,6 +702,146 @@ func (s *Server) handleJobAction(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"id": string(id), "status": string(to)})
 }
 
+// handleDeleteJob removes a job and all of its data (tasks, events, outputs,
+// logs) from the store. Deleting is an explicit operator action for finished
+// jobs so history doesn't accumulate forever; it is refused for jobs that are
+// still actively processing (cancel those first).
+func (s *Server) handleDeleteJob(w http.ResponseWriter, r *http.Request) {
+	id := core.JobID(chi.URLParam(r, "id"))
+	job, err := s.store.LoadJob(r.Context(), id)
+	if errors.Is(err, core.ErrJobNotFound) {
+		writeError(w, http.StatusNotFound, "job_not_found", "no such job")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		return
+	}
+	switch job.Status {
+	case core.JobQueued, core.JobReserved, core.JobRunning, core.JobUploading, core.JobPaused:
+		writeError(w, http.StatusConflict, "job_active",
+			fmt.Sprintf("job %s is %s; cancel it before deleting", job.ID, job.Status))
+		return
+	}
+	if err := s.store.DeleteJob(r.Context(), id); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"id": string(id), "status": "deleted"})
+}
+
+// handleTaskLog returns the saved execution log for a single task.
+func (s *Server) handleTaskLog(w http.ResponseWriter, r *http.Request) {
+	id := core.JobID(chi.URLParam(r, "id"))
+	taskID := core.TaskID(chi.URLParam(r, "taskID"))
+	// verify the task belongs to the job so callers can't read across jobs
+	task, err := s.store.LoadTask(r.Context(), taskID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "task_not_found", "no such task")
+		return
+	}
+	if task.JobID != id {
+		writeError(w, http.StatusNotFound, "task_not_found", "task does not belong to this job")
+		return
+	}
+	log, err := s.store.LoadTaskLog(r.Context(), taskID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"task_id": string(taskID),
+		"log":     log,
+	})
+}
+
+// handleGetAsset returns one produced asset of a job as a base64-encoded data
+// URI, so a caller can grab a thumbnail (or any small output) directly from
+// the API without touching storage. The asset must already be uploaded; the
+// file is read back through the same destination storage the job published to.
+func (s *Server) handleGetAsset(w http.ResponseWriter, r *http.Request) {
+	id := core.JobID(chi.URLParam(r, "id"))
+	name := chi.URLParam(r, "name")
+	job, err := s.store.LoadJob(r.Context(), id)
+	if errors.Is(err, core.ErrJobNotFound) {
+		writeError(w, http.StatusNotFound, "job_not_found", "no such job")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		return
+	}
+	outputs, err := s.store.ListJobOutputs(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		return
+	}
+	var match *core.AssetRef
+	for i := range outputs {
+		if outputs[i].Name == name || outputs[i].Dir+"/"+outputs[i].Name == name {
+			match = &outputs[i]
+			break
+		}
+	}
+	if match == nil {
+		writeError(w, http.StatusNotFound, "asset_not_found", "no such asset for this job")
+		return
+	}
+	if s.stbuild == nil {
+		writeError(w, http.StatusNotImplemented, "not_configured", "storage builder not configured")
+		return
+	}
+	st, err := s.stbuild(r.Context(), job.DestinationID, strings.Trim(job.DestPath, "/"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	rc, err := st.Open(r.Context(), *match)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "asset_unavailable", err.Error())
+		return
+	}
+	defer rc.Close()
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"name": match.Name,
+		"uri":  match.URI,
+		"mime": mimeType(match.Name),
+		"data": base64.StdEncoding.EncodeToString(data),
+	})
+}
+
+// mimeType guesses a media type from a file name for the asset endpoint.
+func mimeType(name string) string {
+	switch strings.ToLower(path.Ext(name)) {
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".png":
+		return "image/png"
+	case ".webp":
+		return "image/webp"
+	case ".gif":
+		return "image/gif"
+	case ".vtt":
+		return "text/vtt"
+	case ".m3u8":
+		return "application/vnd.apple.mpegurl"
+	case ".ts":
+		return "video/mp2t"
+	case ".mp4":
+		return "video/mp4"
+	case ".mp3":
+		return "audio/mpeg"
+	case ".srt":
+		return "text/plain"
+	}
+	return "application/octet-stream"
+}
+
 func (s *Server) handleQueue(w http.ResponseWriter, r *http.Request) {
 	jobs, _ := s.store.ListJobs(r.Context(), core.JobFilter{})
 	byPriority := map[string]int{}
@@ -638,6 +859,36 @@ func (s *Server) handleWorkers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"workers": s.worker.Snapshot()})
+}
+
+// handleScaleWorkers resizes the worker pool at runtime (no daemon restart).
+// count is bounded below by 1 and above by the config workers.max (when set).
+func (s *Server) handleScaleWorkers(w http.ResponseWriter, r *http.Request) {
+	if s.scaler == nil {
+		writeError(w, http.StatusNotImplemented, "not_configured", "worker scaling is not enabled")
+		return
+	}
+	var req struct {
+		Count int `json:"count"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "malformed JSON body")
+		return
+	}
+	if req.Count < 1 {
+		writeError(w, http.StatusBadRequest, "invalid_request", "count must be >= 1")
+		return
+	}
+	if s.cfg.Workers.Max > 0 && req.Count > s.cfg.Workers.Max {
+		writeError(w, http.StatusBadRequest, "invalid_request",
+			fmt.Sprintf("count %d exceeds workers.max %d", req.Count, s.cfg.Workers.Max))
+		return
+	}
+	if err := s.scaler.Scale(r.Context(), req.Count); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"workers": req.Count})
 }
 
 // --- storage servers ---

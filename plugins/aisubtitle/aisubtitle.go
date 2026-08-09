@@ -255,6 +255,9 @@ func (p *Plugin) runWhisper(ctx context.Context, in core.TaskInput, srcLang stri
 				}
 				in.Progress(scaled)
 			}
+			if in.Log != nil {
+				in.Log.Write([]byte(line + "\n"))
+			}
 			if tail.Len() < 4096 {
 				tail.WriteString(line)
 				tail.WriteString("\n")

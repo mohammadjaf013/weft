@@ -115,53 +115,66 @@ func (w *Worker) cycle(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return w.execute(ctx, reserved)
+	if reserved == nil {
+		// another worker claimed this task first; try again next cycle
+		return nil
+	}
+	return w.execute(ctx, *reserved)
 }
 
-func (w *Worker) reserve(ctx context.Context, task core.Task) (core.Task, error) {
+// reserve atomically claims a task for this worker and transitions the job to
+// running. When another worker already leased the task it returns nil, nil so
+// the caller skips it (two workers both saw it runnable in NextReady).
+func (w *Worker) reserve(ctx context.Context, task core.Task) (*core.Task, error) {
 	w.currentTask = string(task.ID)
 	w.lastHeartbeat = core.Now()
 
-	// task-level transition: leased
+	// task-level transition: leased (atomic claim so >1 worker never
+	// double-processes the same task)
+	exp := core.Now().Add(w.opts.LeaseTTL)
+	started := core.Now()
 	task.Status = core.TaskLeased
 	task.WorkerID = w.id
-	exp := core.Now().Add(w.opts.LeaseTTL)
 	task.LeaseExpiresAt = &exp
-	started := core.Now()
 	task.StartedAt = &started
-	if err := w.opts.Store.SaveTask(ctx, task); err != nil {
-		return task, err
+	claimed, err := w.opts.Store.TryLease(ctx, task, w.id, exp, started)
+	if err != nil {
+		return &task, err
+	}
+	if !claimed {
+		w.currentTask = ""
+		return nil, nil
 	}
 
 	// job-level: reserved (first time) → running → (uploading for upload tasks)
 	job, err := w.opts.Store.LoadJob(ctx, task.JobID)
 	if err != nil {
-		return task, err
+		return &task, err
 	}
 	switch job.Status {
 	case core.JobQueued:
 		if err := w.opts.SM.Transition(ctx, job.ID, core.JobReserved, ""); err != nil {
-			return task, err
+			return &task, err
 		}
 		fallthrough
 	case core.JobReserved:
 		if err := w.opts.SM.Transition(ctx, job.ID, core.JobRunning, ""); err != nil {
-			return task, err
+			return &task, err
 		}
 		fallthrough
 	case core.JobRunning:
 		// upload-phase tasks move the job into the uploading state
 		if task.Kind == "upload" {
 			if err := w.opts.SM.Transition(ctx, job.ID, core.JobUploading, ""); err != nil {
-				return task, err
+				return &task, err
 			}
 		}
 	case core.JobPaused:
 		if err := w.opts.SM.Transition(ctx, job.ID, core.JobResumed, ""); err != nil {
-			return task, err
+			return &task, err
 		}
 	}
-	return task, nil
+	return &task, nil
 }
 
 // supervise watches job status while a task executes. When the operator pauses
@@ -281,6 +294,10 @@ func (w *Worker) execute(ctx context.Context, task core.Task) error {
 		Params:   map[string]any{},
 		Executor: w.opts.Executor,
 	}
+	// capture the task's process stderr so it can be inspected post-hoc; saved
+	// once the plugin returns (success or failure).
+	var logBuf cappedBuffer
+	in.Log = &logBuf
 	// per-task params set at creation time (e.g. subtitle lang) reach the plugin
 	for k, v := range task.Params {
 		in.Params[k] = v
@@ -332,6 +349,7 @@ func (w *Worker) execute(ctx context.Context, task core.Task) error {
 	stopSupervise := w.supervise(ctx, task)
 	out, err := w.opts.Registry.Process(ctx, task.Kind, in)
 	stopSupervise()
+	w.saveLog(ctx, task, logBuf.String())
 	if err != nil {
 		w.opts.Sched.MarkFailed(ctx, task.ID, err)
 		w.currentTask = ""
@@ -353,3 +371,48 @@ func (w *Worker) execute(ctx context.Context, task core.Task) error {
 	w.currentTask = ""
 	return nil
 }
+
+// saveLog persists the captured task log to the store when it supports task
+// logs (sqlite.Store does). Best effort: a failed write must not fail the task.
+func (w *Worker) saveLog(ctx context.Context, task core.Task, text string) {
+	if text == "" {
+		return
+	}
+	type logStore interface {
+		SaveTaskLog(ctx context.Context, taskID core.TaskID, jobID core.JobID, log string) error
+	}
+	ls, ok := w.opts.Store.(logStore)
+	if !ok {
+		return
+	}
+	if err := ls.SaveTaskLog(ctx, task.ID, task.JobID, text); err != nil {
+		log.Printf("worker %s save log for %s: %v", w.id, task.ID, err)
+	}
+}
+
+// cappedBuffer is a bounded byte buffer (io.Writer) that keeps the tail of a
+// command's output so runaway logs can't grow memory without bound. Task logs
+// are further capped by the store.
+type cappedBuffer struct {
+	buf []byte
+	max int
+}
+
+func (b *cappedBuffer) Write(p []byte) (int, error) {
+	if b.max == 0 {
+		b.max = 256 * 1024
+	}
+	n := len(b.buf) + len(p)
+	if n > b.max {
+		if len(p) >= b.max {
+			b.buf = append([]byte(nil), p[len(p)-b.max:]...)
+			return len(p), nil
+		}
+		drop := n - b.max
+		b.buf = append(b.buf[:0], b.buf[drop:]...)
+	}
+	b.buf = append(b.buf, p...)
+	return len(p), nil
+}
+
+func (b *cappedBuffer) String() string { return string(b.buf) }

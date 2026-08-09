@@ -56,7 +56,7 @@ func (km *KeyManager) Verify(token string) (sqlite.APIKey, error) {
 		return sqlite.APIKey{
 			ID:     "admin",
 			Name:   "admin",
-			Scopes: []string{"jobs:read", "jobs:write", "queue:read", "workers:read", "storage:manage", "webhooks:manage", "profiles:read", "plugins:read", "metrics:read", "keys:manage"},
+			Scopes: []string{"jobs:read", "jobs:write", "queue:read", "workers:read", "workers:write", "storage:manage", "webhooks:manage", "profiles:read", "plugins:read", "metrics:read", "keys:manage"},
 		}, nil
 	}
 	keys, err := km.store.ListAPIKeys(context.Background())
