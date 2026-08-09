@@ -204,63 +204,32 @@ See [docs/SETUP-FA.md](docs/SETUP-FA.md) for the full configuration reference an
 
 ---
 
-## CLI reference
+## CLI & REST API
+
+Every CLI command is a thin client over a matching REST endpoint — nothing
+is CLI-only. The most-used ones:
 
 ```
-weft serve [--config <path>]           run the agent daemon
-weft init-config [<path>]              write a default weft.yaml
-weft doctor [--config <path>]          check ffmpeg, config, db, connectivity
-weft version                           print version
-
-weft jobs list [--status S] [--priority P] [--limit N]
-weft jobs get <id>
-weft jobs create <input_ref> --profile <name> [--priority P]
-                [--destination N] [--source-server N] [--path P] [--name N]
-                [--lang L] [--src-lang S] [--provider whisper|gemini|hybrid]
-                [--trim-start S] [--trim-end S]
-                [--thumb-count N | --thumb-at S] [--thumb-size WxH|original]
-                [--forced] [--default]
-weft jobs events <id> | log <id> <task_id> | asset <id> <name>
-weft jobs action <id> <cancel|retry|pause|resume>
-weft jobs priority <id> <emergency|high|normal|low|background>
-weft jobs delete <id>
-
-weft keys create <name> <scope...> | keys list | keys delete <id>
-weft webhooks create <url> <event...> [--secret S] | list | delete <id> | replay <event_id>
-weft storage list | add <id> <type> [--host H] [--user U]
-weft queue | workers [scale <n>] | profiles | plugins | metrics | system
-weft benchmark [run] | benchmark get
-weft config export [--out F] [--include-secrets] | config import <file>
-weft cron list | cron run <cleanup|benchmark|health_scan>
-weft dashboard [--interval 2s]     # live TUI: jobs/queue/workers/system, select+act
+weft serve --config <path>             run the agent daemon
+weft doctor                            check ffmpeg, config, db, connectivity
+weft jobs create <input_ref> --profile <name> [flags...]
+weft jobs list | get <id> | action <id> <cancel|retry|pause|resume> | delete <id>
+weft dashboard                         live TUI: jobs/queue/workers/system, select+act
+weft queue | workers | system | benchmark
+weft webhooks create <url> <event...> | keys create <name> <scope...>
+weft storage add <id> <type> ...       register a destination/source server
+weft config export/import | cron list/run
 ```
 
-All remote commands accept `--api <url>` and `--key <token>`.
+`weft jobs create` alone takes ~20 flags (priority, destination/source
+server, trim window, custom thumbnails, subtitle language/provider, forced/
+default track flags, ...); the REST surface mirrors it 1:1, scoped by API
+key (`jobs:write`, `storage:manage`, `config:manage`, ...). All remote
+commands accept `--api <url>` and `--key <token>`.
 
----
-
-## REST API
-
-| Method | Path | Scope |
-|---|---|---|
-| GET | `/health` | — |
-| GET/POST | `/jobs` | `jobs:read` / `jobs:write` |
-| GET | `/jobs/{id}`, `/jobs/{id}/events`, `/jobs/{id}/tasks/{taskID}/log`, `/jobs/{id}/assets/{name}` | `jobs:read` |
-| DELETE | `/jobs/{id}` | `jobs:write` |
-| PATCH | `/jobs/{id}/priority` | `jobs:write` |
-| POST | `/jobs/{id}/{action}` (cancel/retry/pause/resume) | `jobs:write` |
-| GET | `/queue`, `/workers` | `queue:read`, `workers:read` |
-| POST | `/workers/scale` | `workers:write` |
-| GET/POST | `/storage/servers` | `storage:manage` |
-| POST | `/storage/rebuild-master` | `storage:manage` |
-| GET/POST/DELETE | `/webhooks` (+ `/webhooks/{id}/replay`) | `webhooks:manage` |
-| GET/POST/DELETE | `/keys` | `keys:manage` |
-| GET | `/profiles`, `/plugins` | `profiles:read`, `plugins:read` |
-| POST/GET | `/benchmark`, `/metrics`, `/system` | `metrics:read` |
-| GET/POST | `/config/export`, `/config/import` | `config:manage` |
-| GET/POST | `/cron`, `/cron/{job}/run` | `cron:manage` |
-
-Error responses are structured: `{"error": {"code": "...", "message": "..."}}`. Full reference (request/response shapes, worked examples): [docs/REFERENCE.md](docs/REFERENCE.md).
+**Full CLI + REST reference — every flag, every endpoint, request/response
+shapes, worked examples:** [docs/REFERENCE.md](docs/REFERENCE.md) (English) ·
+[docs/CLI-API-FA.md](docs/CLI-API-FA.md) (Persian).
 
 ---
 
@@ -306,21 +275,34 @@ We want Weft to become the infrastructure layer where companies can run video, a
 
 ## Roadmap
 
-Weft already supports core media-processing workflows, including distributed FFmpeg processing, HLS generation, subtitles, thumbnails, encryption, and AI-powered subtitle processing. Our next roadmap is focused on expanding these capabilities while building the infrastructure underneath them:
+Weft today is a **single-node** agent: DAG job pipelines, crash recovery,
+priority queues + a resource-aware worker pool (CPU/RAM), remote sources,
+whisper/Gemini AI subtitles, webhooks, a live CLI dashboard, cron
+maintenance jobs, and config export/import — all shipped, not planned. The
+roadmap is what's genuinely still ahead, mostly things that only make sense
+once there's more than one node or more than one media capability class:
 
-- **Distributed Media Orchestration** — reliable scheduling and execution of multimedia workloads across multiple servers.
-- **Resource-Aware Scheduling** — intelligent scheduling based on CPU, RAM, disk, GPU, concurrency, and worker availability.
-- **Advanced Job Management** — priorities, retries, pause/resume, crash recovery, dependencies, persistent state, and automatic workload redistribution.
-- **AI Subtitle & Localization** — expanding the existing AI subtitle capabilities into automatic transcription, translation, subtitle synchronization, quality improvement, and multi-language localization workflows.
-- **AI Media Processing** — adding AI-powered workflows for tasks such as speech detection, audio enhancement, scene analysis, metadata generation, content understanding, and automated media enrichment.
-- **Advanced Video Processing** — encoding pipelines, HLS/DASH packaging, multiple quality profiles, thumbnails, previews, audio processing, encryption, and automated media optimization.
-- **GPU Workloads** — support for GPU-aware scheduling and AI/video workloads that require dedicated GPU resources.
-- **Media Workflow Pipelines** — allowing complex processing workflows to be defined as reusable pipelines with dependencies between jobs.
-- **Observability & Operations** — real-time monitoring, metrics, logs, worker health, resource usage, job progress, and failure analysis.
-- **Storage & Cloud Integrations** — flexible integration with S3-compatible storage, local storage, object storage, and different deployment environments.
-- **Kubernetes-like Multimedia Orchestration** — our long-term goal is to build an orchestration layer specifically designed for video and audio workloads, bringing the concepts of scheduling, workers, resources, scaling, and recovery to multimedia infrastructure.
+- **Distributed / cluster orchestration** — scheduling and execution across
+  *multiple* Weft nodes (today's resource-aware scheduling is per-node
+  only); node discovery, failover, and workload redistribution across a
+  cluster.
+- **GPU-aware scheduling** — GPU as a schedulable resource, alongside the
+  existing CPU/RAM budget, for GPU-accelerated encode/AI workloads.
+- **Job-to-job pipelines** — chaining complete jobs together with
+  dependencies (distinct from today's DAG, which sequences *tasks within
+  one job*).
+- **AI subtitle quality** — subtitle sync correction and multi-provider
+  quality comparison, beyond today's transcribe-then-translate.
+- **Broader AI media processing** — speech detection, audio enhancement,
+  scene analysis, metadata generation, content enrichment.
+- **DASH packaging and HLS/DASH encryption** (AES-128, Sample-AES, DRM) —
+  today's HLS output is unencrypted.
+- **More storage backends** — GCS, Azure Blob, and others beyond today's
+  local/SSH/S3.
 
-Development of the roadmap is funded through subscriptions, which help fund development infrastructure, multi-server and GPU testing environments, AI processing costs, real-world workload testing, documentation, and developer tooling.
+Development is funded through subscriptions, which help fund development
+infrastructure, multi-server and GPU testing environments, AI processing
+costs, real-world workload testing, documentation, and developer tooling.
 
 ---
 
