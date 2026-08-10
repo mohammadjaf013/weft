@@ -112,6 +112,7 @@ func jobsGet(args []string) error {
 		Profile         string  `json:"profile"`
 		InputRef        string  `json:"input_ref"`
 		DestinationID   int     `json:"destination_id"`
+		DestPath        string  `json:"dest_path"`
 		Verified        bool    `json:"verified"`
 		OverallProgress float64 `json:"overall_progress"`
 		Error           string  `json:"error"`
@@ -134,8 +135,8 @@ func jobsGet(args []string) error {
 	}
 	fmt.Printf("job %s  status=%s  priority=%s  profile=%s  verified=%v\n",
 		out.ID, out.Status, out.Priority, out.Profile, out.Verified)
-	fmt.Printf("  input=%s  destination=%d  progress=%.1f%%\n",
-		out.InputRef, out.DestinationID, out.OverallProgress)
+	fmt.Printf("  input=%s  destination=%d  dest_path=%s  progress=%.1f%%\n",
+		out.InputRef, out.DestinationID, out.DestPath, out.OverallProgress)
 	if out.Error != "" {
 		fmt.Printf("  error=%s\n", out.Error)
 	}

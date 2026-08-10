@@ -241,10 +241,11 @@ func storageList(args []string) error {
 	c := newClient(rf)
 	var out struct {
 		Servers []struct {
-			ID   int    `json:"id"`
-			Type string `json:"type"`
-			Host string `json:"host"`
-			User string `json:"user"`
+			ID       int    `json:"id"`
+			Type     string `json:"type"`
+			Host     string `json:"host"`
+			User     string `json:"user"`
+			BasePath string `json:"base_path"`
 		} `json:"servers"`
 	}
 	if err := c.get("/storage/servers", &out); err != nil {
@@ -254,9 +255,9 @@ func storageList(args []string) error {
 		fmt.Println("no storage servers (destination 0 = default local)")
 		return nil
 	}
-	w := newTable("ID", "TYPE", "HOST", "USER")
+	w := newTable("ID", "TYPE", "HOST", "USER", "BASE_PATH")
 	for _, s := range out.Servers {
-		w.row(fmt.Sprintf("%d", s.ID), s.Type, s.Host, s.User)
+		w.row(fmt.Sprintf("%d", s.ID), s.Type, s.Host, s.User, s.BasePath)
 	}
 	w.print()
 	return nil

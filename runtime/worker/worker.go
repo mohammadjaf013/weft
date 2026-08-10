@@ -6,6 +6,7 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"log"
 	"sync"
 	"time"
@@ -391,6 +392,14 @@ func (w *Worker) execute(ctx context.Context, task core.Task) error {
 				return serr
 			}
 			in.Storage = st
+			// ssh.Storage caches its connection across every Save/Open/Delete
+			// call made during this task (see plugins/storage/ssh) instead of
+			// reconnecting per file; release it once the task is done. Storage
+			// implementations with nothing to release (local, s3) don't
+			// implement io.Closer, so this is a no-op for them.
+			if closer, ok := st.(io.Closer); ok {
+				defer closer.Close()
+			}
 		}
 	}
 	if task.Kind == "upload" {

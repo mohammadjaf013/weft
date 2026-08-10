@@ -697,6 +697,65 @@ func TestJobCreateWithSourceServer(t *testing.T) {
 	}
 }
 
+// TestJobGetExposesDestPath guards against destination_id being visible
+// without the subdirectory it was combined with: an operator debugging
+// "where did my upload actually go" needs destination_id (which storage
+// server) AND dest_path (which subdir under that server's base_path) — the
+// API used to return only the former.
+func TestJobGetExposesDestPath(t *testing.T) {
+	srv, _, km := newTestServer(t)
+	raw, _, _ := km.Create("w", []string{"jobs:write", "jobs:read"})
+	rr := doRequest(t, srv, "POST", "/jobs", `{"input_ref":"x","profile":"vod-h264","path":"Movie-Test/17322419-2206-4ec0-8bef-b70cb9a6752d"}`, raw)
+	if rr.Code != 201 {
+		t.Fatalf("create = %d: %s", rr.Code, rr.Body.String())
+	}
+	var created map[string]any
+	json.Unmarshal(rr.Body.Bytes(), &created)
+	id := created["id"].(string)
+
+	rr = doRequest(t, srv, "GET", "/jobs/"+id, "", raw)
+	var got map[string]any
+	json.Unmarshal(rr.Body.Bytes(), &got)
+	want := "Movie-Test/17322419-2206-4ec0-8bef-b70cb9a6752d"
+	if got["dest_path"] != want {
+		t.Fatalf("GET /jobs/{id} dest_path = %v, want %q", got["dest_path"], want)
+	}
+}
+
+// TestStorageListExposesBasePath guards against destination_id being
+// meaningless without knowing the disk root it resolves to: base_path isn't
+// a credential (unlike key_path/password/access_key/secret_key, which must
+// stay hidden), so it should be visible alongside host/type.
+func TestStorageListExposesBasePath(t *testing.T) {
+	srv, _, km := newTestServer(t)
+	raw, _, _ := km.Create("w", []string{"storage:manage"})
+	rr := doRequest(t, srv, "POST", "/storage/servers", `{"id":7,"type":"local","config":{"base_path":"/var/videos"}}`, raw)
+	if rr.Code != 201 {
+		t.Fatalf("register server = %d: %s", rr.Code, rr.Body.String())
+	}
+
+	rr = doRequest(t, srv, "GET", "/storage/servers", "", raw)
+	if rr.Code != 200 {
+		t.Fatalf("list = %d: %s", rr.Code, rr.Body.String())
+	}
+	var got struct {
+		Servers []map[string]any `json:"servers"`
+	}
+	json.Unmarshal(rr.Body.Bytes(), &got)
+	found := false
+	for _, sv := range got.Servers {
+		if sv["id"] == float64(7) {
+			found = true
+			if sv["base_path"] != "/var/videos" {
+				t.Errorf("base_path = %v, want /var/videos", sv["base_path"])
+			}
+		}
+	}
+	if !found {
+		t.Fatal("registered server 7 not in /storage/servers list")
+	}
+}
+
 func TestSystemEndpoint(t *testing.T) {
 	srv, _, km := newTestServer(t)
 	raw, _, _ := km.Create("m", []string{"metrics:read"})

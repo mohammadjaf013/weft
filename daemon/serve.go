@@ -314,6 +314,9 @@ func (d *Daemon) fetchFromSourceServer(ctx context.Context, job core.Job, relPat
 	if err != nil {
 		return "", fmt.Errorf("source_server_id %d: %w", job.SourceServerID, err)
 	}
+	if closer, ok := st.(io.Closer); ok {
+		defer closer.Close()
+	}
 	rc, err := st.Open(ctx, core.AssetRef{Name: relPath})
 	if err != nil {
 		return "", fmt.Errorf("fetch source %q from server %d: %w", relPath, job.SourceServerID, err)

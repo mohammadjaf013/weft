@@ -14,6 +14,7 @@ type fakeConn struct {
 	out      []byte
 	stdin    []byte
 	err      error
+	closed   int
 }
 
 func (f *fakeConn) Run(_ context.Context, cmd string, stdin io.Reader) ([]byte, error) {
@@ -25,7 +26,7 @@ func (f *fakeConn) Run(_ context.Context, cmd string, stdin io.Reader) ([]byte, 
 	return f.out, f.err
 }
 
-func (f *fakeConn) Close() error { return nil }
+func (f *fakeConn) Close() error { f.closed++; return nil }
 
 func newTest(t *testing.T, cfg Config) (*Storage, *fakeConn) {
 	t.Helper()
@@ -91,6 +92,57 @@ func TestCopyRunsCp(t *testing.T) {
 	}
 	if !strings.Contains(fc.commands[0], "cp ") {
 		t.Errorf("expected cp: %v", fc.commands)
+	}
+}
+
+// TestMultipleOpsDoNotCloseTheConnectionBetweenCalls guards against
+// reintroducing a dial+close per file: a job uploading a full HLS ladder
+// makes dozens of Save calls, and each used to pay a full TCP+SSH handshake
+// because the old code closed the connection at the end of every method.
+func TestMultipleOpsDoNotCloseTheConnectionBetweenCalls(t *testing.T) {
+	s, fc := newTest(t, Config{KeyPath: "/k"})
+	for i := 0; i < 5; i++ {
+		if err := s.Save(context.Background(), core.AssetRef{Name: "seg.ts", URI: "ssh:seg.ts"}, strings.NewReader("x")); err != nil {
+			t.Fatalf("Save %d: %v", i, err)
+		}
+	}
+	if fc.closed != 0 {
+		t.Errorf("connection closed %d times mid-job; Save must not close the shared connection", fc.closed)
+	}
+}
+
+// TestConnectCachesAndCloseReleases exercises the caching path directly
+// (bypassing cfg.Conn, which always short-circuits to the injected fake) by
+// seeding the unexported cache field, since a real dial isn't unit-testable
+// without a listening SSH server.
+func TestConnectCachesAndCloseReleases(t *testing.T) {
+	s, err := New(Config{Host: "10.0.0.1", User: "weft", KeyPath: "/k"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	fc := &fakeConn{out: []byte("cached")}
+	s.conn = fc
+
+	got, err := s.connect(context.Background())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	if got != Conn(fc) {
+		t.Fatal("connect() should return the cached connection instead of dialing")
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if fc.closed != 1 {
+		t.Errorf("Close() should close the cached connection exactly once, got %d", fc.closed)
+	}
+	if s.conn != nil {
+		t.Error("Close() should clear the cached connection")
+	}
+	// Close is safe to call again (no cached connection left).
+	if err := s.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
 	}
 }
 

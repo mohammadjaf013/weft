@@ -345,6 +345,7 @@ Validation errors (`400`): `invalid_request` (malformed / missing fields),
   "profile": "vod-h264",
   "input_ref": "/srv/weft/film.mp4",
   "destination_id": 0,
+  "dest_path": "Series-Test/movie1",
   "source_server_id": 0,
   "verified": false,
   "overall_progress": 42.5,
@@ -757,7 +758,9 @@ Durability model:
   production.
 - **Webhook signatures**: `HMAC-SHA256(secret, body)` in `X-Weft-Signature`.
 - Storage server credentials (SSH keys/passwords, S3 keys) are stored in the
-  DB and **never** returned by `GET /storage/servers`.
+  DB and **never** returned by `GET /storage/servers` — only `id`/`type`/
+  `host`/`user`/`base_path` (not secret; needed to know where a
+  `destination_id` actually resolves on disk).
 
 ---
 

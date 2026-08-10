@@ -720,6 +720,7 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 		"profile":          job.Profile,
 		"input_ref":        job.InputRef,
 		"destination_id":   job.DestinationID,
+		"dest_path":        job.DestPath,
 		"source_server_id": job.SourceServerID,
 		"verified":         job.Verified,
 		"overall_progress": op,
@@ -927,6 +928,9 @@ func (s *Server) handleDeleteJob(w http.ResponseWriter, r *http.Request) {
 	if purgeFiles && s.stbuild != nil {
 		if outputs, oerr := s.store.ListJobOutputs(r.Context(), id); oerr == nil {
 			if st, berr := s.stbuild(r.Context(), job.DestinationID, strings.Trim(job.DestPath, "/")); berr == nil {
+				if closer, ok := st.(io.Closer); ok {
+					defer closer.Close()
+				}
 				for _, a := range outputs {
 					if derr := st.Delete(r.Context(), a); derr != nil {
 						// best-effort: a flaky/unreachable remote must not block
@@ -1028,6 +1032,9 @@ func (s *Server) handleGetAsset(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
+	}
+	if closer, ok := st.(io.Closer); ok {
+		defer closer.Close()
 	}
 	rc, err := st.Open(r.Context(), *match)
 	if err != nil {
@@ -1179,10 +1186,15 @@ func (s *Server) handleListServers(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]map[string]any, 0, len(servers))
 	for _, sv := range servers {
-		// never return key material
+		// never return key material (key_path/password/access_key/secret_key
+		// stay inside sv.Config, unexported here); base_path is not a secret
+		// and operators need it to know where a destination_id actually
+		// resolves on disk, so it's the one Config key surfaced explicitly.
+		basePath, _ := sv.Config["base_path"].(string)
 		out = append(out, map[string]any{
-			"id":   sv.ID,
-			"type": sv.Type,
+			"id":        sv.ID,
+			"type":      sv.Type,
+			"base_path": basePath,
 			"host": sv.Host,
 			"user": sv.User,
 		})
@@ -1210,6 +1222,9 @@ func (s *Server) handleRebuildMaster(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
+	}
+	if closer, ok := st.(io.Closer); ok {
+		defer closer.Close()
 	}
 	p, err := rebuild.Rebuild(r.Context(), st, req.Codec)
 	if err != nil {

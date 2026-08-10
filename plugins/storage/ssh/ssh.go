@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -68,6 +69,9 @@ func (c *realConn) Close() error { return c.client.Close() }
 
 type Storage struct {
 	cfg Config
+
+	mu   sync.Mutex
+	conn Conn // cached, reused across calls; nil until first real connect
 }
 
 var _ core.Storage = (*Storage)(nil)
@@ -109,10 +113,20 @@ func (s *Storage) auth() (ssh.AuthMethod, error) {
 	return ssh.PublicKeys(signer), nil
 }
 
-// connect opens (or returns) a Conn for the configured server.
+// connect returns a Conn for the configured server, dialing once and caching
+// the connection for reuse across every Open/Save/Delete/Copy/List call made
+// on this Storage instance. A fresh TCP dial + SSH handshake per file (the
+// previous behavior) made uploading an HLS rendition ladder — hundreds of
+// small segment files — dominated by reconnect latency instead of transfer
+// time. Call Close when done with this Storage to release the connection.
 func (s *Storage) connect(ctx context.Context) (Conn, error) {
 	if s.cfg.Conn != nil {
 		return s.cfg.Conn, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.conn != nil {
+		return s.conn, nil
 	}
 	auth, err := s.auth()
 	if err != nil {
@@ -135,7 +149,23 @@ func (s *Storage) connect(ctx context.Context) (Conn, error) {
 		conn.Close()
 		return nil, fmt.Errorf("ssh auth to %s: %w", addr, err)
 	}
-	return &realConn{client: ssh.NewClient(c, chans, reqs)}, nil
+	s.conn = &realConn{client: ssh.NewClient(c, chans, reqs)}
+	return s.conn, nil
+}
+
+// Close releases the cached SSH connection, if one was opened. Callers that
+// build a Storage for a bounded operation (one task, one request) should
+// close it when done — e.g. via an io.Closer type-assertion, since the core.Storage
+// interface itself has no Close method and local/s3 have nothing to release.
+func (s *Storage) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.conn == nil {
+		return nil
+	}
+	err := s.conn.Close()
+	s.conn = nil
+	return err
 }
 
 func (s *Storage) remotePath(ref core.AssetRef) string {
@@ -161,7 +191,6 @@ func (s *Storage) Open(ctx context.Context, ref core.AssetRef) (io.ReadCloser, e
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
 	out, err := conn.Run(ctx, "cat '"+s.remotePath(ref)+"'", nil)
 	if err != nil {
 		return nil, fmt.Errorf("ssh cat failed: %w", err)
@@ -174,7 +203,6 @@ func (s *Storage) Save(ctx context.Context, ref core.AssetRef, r io.Reader) erro
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
 	dir := filepath.ToSlash(filepath.Dir(s.remotePath(ref)))
 	if _, err := conn.Run(ctx, "mkdir -p '"+dir+"'", nil); err != nil {
 		return fmt.Errorf("ssh mkdir failed: %w", err)
@@ -190,7 +218,6 @@ func (s *Storage) Delete(ctx context.Context, ref core.AssetRef) error {
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
 	if _, err := conn.Run(ctx, "rm -f '"+s.remotePath(ref)+"'", nil); err != nil {
 		return fmt.Errorf("ssh rm failed: %w", err)
 	}
@@ -202,7 +229,6 @@ func (s *Storage) Copy(ctx context.Context, src, dst core.AssetRef) error {
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
 	if _, err := conn.Run(ctx, "cp '"+s.remotePath(src)+"' '"+s.remotePath(dst)+"'", nil); err != nil {
 		return fmt.Errorf("ssh cp failed: %w", err)
 	}
@@ -229,7 +255,6 @@ func (s *Storage) List(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
 	out, err := conn.Run(ctx, "cd '"+s.cfg.BasePath+"' && find . -type f | sort", nil)
 	if err != nil {
 		return nil, fmt.Errorf("ssh find failed: %w", err)
