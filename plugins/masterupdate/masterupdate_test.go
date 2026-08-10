@@ -71,6 +71,87 @@ func TestUpdatePlaylistAddsTwoLangs(t *testing.T) {
 	}
 }
 
+// TestUpdatePlaylistSubtitleAppliesToAllRenditions is the regression test for
+// a production bug: SUBTITLES="subs" was only being appended to the first
+// EXT-X-STREAM-INF line seen (a "firstStream" latch in updatePlaylist), so on
+// a real 4-rendition ladder only 360p ended up tagged after adding "fa", and
+// only 480p after subsequently adding "en" -- 720p/1080p never got the
+// group reference and so never offered subtitles to the player.
+const fourRungMaster = `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-STREAM-INF:BANDWIDTH=1208000,RESOLUTION=640x360
+360p.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=1928000,RESOLUTION=852x480
+480p.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=3792000,RESOLUTION=1280x720
+720p.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=7392000,RESOLUTION=1920x1080
+1080p.m3u8
+`
+
+func TestUpdatePlaylistSubtitleAppliesToAllRenditions(t *testing.T) {
+	out, err := updatePlaylist(fourRungMaster, "subtitle", "fa", "subtitle/fa/movie.vtt", false, false)
+	if err != nil {
+		t.Fatalf("updatePlaylist: %v", err)
+	}
+	if n := strings.Count(out, `SUBTITLES="subs"`); n != 4 {
+		t.Errorf("expected SUBTITLES=\"subs\" on all 4 renditions, got %d:\n%s", n, out)
+	}
+
+	// Adding a second language must not duplicate the attribute or leave any
+	// rendition behind.
+	out, err = updatePlaylist(out, "subtitle", "en", "subtitle/en/movie.vtt", false, false)
+	if err != nil {
+		t.Fatalf("updatePlaylist: %v", err)
+	}
+	if n := strings.Count(out, `SUBTITLES="subs"`); n != 4 {
+		t.Errorf("expected SUBTITLES=\"subs\" on all 4 renditions after 2nd lang, got %d:\n%s", n, out)
+	}
+}
+
+// TestUpdatePlaylistAudioAppliesToAllRenditions mirrors the subtitle
+// regression above for the "audio" track kind -- same updatePlaylist code
+// path, same bug, same fix.
+func TestUpdatePlaylistAudioAppliesToAllRenditions(t *testing.T) {
+	out, err := updatePlaylist(fourRungMaster, "audio", "fa", "audio/fa/movie.m3u8", false, false)
+	if err != nil {
+		t.Fatalf("updatePlaylist: %v", err)
+	}
+	if n := strings.Count(out, `AUDIO="audio"`); n != 4 {
+		t.Errorf("expected AUDIO=\"audio\" on all 4 renditions, got %d:\n%s", n, out)
+	}
+}
+
+// TestUpdatePlaylistDefaultCanBeToggledByResend verifies that re-running
+// updatePlaylist for the same language with a different `default` value
+// replaces the previous EXT-X-MEDIA line (via the existing same-language
+// replace semantics) rather than adding a duplicate -- so removing a
+// previously-set DEFAULT=YES just means calling subtitle-add again with
+// --default omitted/false for the same --lang.
+func TestUpdatePlaylistDefaultCanBeToggledByResend(t *testing.T) {
+	out, err := updatePlaylist(fourRungMaster, "subtitle", "fa", "subtitle/fa/movie.vtt", false, true)
+	if err != nil {
+		t.Fatalf("updatePlaylist: %v", err)
+	}
+	if !strings.Contains(out, `LANGUAGE="fa"`) || !strings.Contains(out, "DEFAULT=YES") {
+		t.Fatalf("expected fa subtitle DEFAULT=YES after first send:\n%s", out)
+	}
+
+	out, err = updatePlaylist(out, "subtitle", "fa", "subtitle/fa/movie.vtt", false, false)
+	if err != nil {
+		t.Fatalf("updatePlaylist: %v", err)
+	}
+	if n := strings.Count(out, `LANGUAGE="fa"`); n != 1 {
+		t.Errorf("expected exactly 1 fa media line after resend, got %d:\n%s", n, out)
+	}
+	if strings.Contains(out, "DEFAULT=YES") {
+		t.Errorf("expected DEFAULT=NO after resending with default=false:\n%s", out)
+	}
+	if !strings.Contains(out, "DEFAULT=NO") {
+		t.Errorf("expected DEFAULT=NO present after resend:\n%s", out)
+	}
+}
+
 func TestUpdatePlaylistAudioGroup(t *testing.T) {
 	out, err := updatePlaylist(baseMaster, "audio", "fa", "audio/fa/movie.m3u8", false, false)
 	if err != nil {

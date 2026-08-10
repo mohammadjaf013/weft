@@ -127,17 +127,14 @@ func updatePlaylist(master, kind, lang, uri string, forced, isDefault bool) (str
 
 	var b strings.Builder
 	mediaWritten := false
-	firstStream := true
 	for _, l := range lines {
 		if strings.HasPrefix(l, "#EXT-X-STREAM-INF:") {
 			if !mediaWritten {
 				writeMedia(&b, media)
 				mediaWritten = true
 			}
-			attr := groupAttr(l, mediaType, group)
-			if firstStream && attr != "" {
+			if attr := groupAttr(l, mediaType, group); attr != "" {
 				l = attr
-				firstStream = false
 			}
 			b.WriteString(l)
 			b.WriteString("\n")
