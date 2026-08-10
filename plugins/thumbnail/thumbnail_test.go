@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -245,6 +246,126 @@ func TestProcessSingleThumbAt(t *testing.T) {
 	}
 	if !scale {
 		t.Errorf("thumb_at missing scale=640:360: %v", args[0])
+	}
+}
+
+// realMasterPlaylist mirrors mediautil.MasterPlaylistCodec's actual output
+// shape (see the production log this is a regression test for): four
+// renditions named "{label}.m3u8" in ascending order, with subtitle
+// EXT-X-MEDIA lines interspersed before the stream-infs.
+const realMasterPlaylist = `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-INDEPENDENT-SEGMENTS
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="فارسی",DEFAULT=NO,AUTOSELECT=YES,FORCED=NO,LANGUAGE="fa",URI="subtitle/fa/فارسی.vtt"
+#EXT-X-STREAM-INF:BANDWIDTH=1208000,AVERAGE-BANDWIDTH=1028000,RESOLUTION=640x360,FRAME-RATE=23.976,CODECS="avc1.64001E,mp4a.40.2",SUBTITLES="subs"
+360p.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=1928000,AVERAGE-BANDWIDTH=1628000,RESOLUTION=852x480,FRAME-RATE=23.976,CODECS="avc1.64001F,mp4a.40.2",SUBTITLES="subs"
+480p.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=3792000,AVERAGE-BANDWIDTH=3192000,RESOLUTION=1280x720,FRAME-RATE=23.976,CODECS="avc1.640020,mp4a.40.2"
+720p.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=7392000,AVERAGE-BANDWIDTH=6192000,RESOLUTION=1920x1080,FRAME-RATE=23.976,CODECS="avc1.640028,mp4a.40.2"
+1080p.m3u8
+`
+
+func TestResolveHLSRenditionPrefers1080p(t *testing.T) {
+	dir := t.TempDir()
+	master := filepath.Join(dir, "playlist.m3u8")
+	if err := os.WriteFile(master, []byte(realMasterPlaylist), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := resolveHLSRendition(master)
+	want := filepath.Join(dir, "1080p.m3u8")
+	if got != want {
+		t.Errorf("resolveHLSRendition = %q, want %q", got, want)
+	}
+}
+
+func TestResolveHLSRenditionFallsBackWhen1080pMissing(t *testing.T) {
+	m3u8 := `#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=1928000,RESOLUTION=852x480
+480p.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=3792000,RESOLUTION=1280x720
+720p.m3u8
+`
+	dir := t.TempDir()
+	master := filepath.Join(dir, "playlist.m3u8")
+	if err := os.WriteFile(master, []byte(m3u8), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := resolveHLSRendition(master)
+	want := filepath.Join(dir, "720p.m3u8")
+	if got != want {
+		t.Errorf("resolveHLSRendition = %q, want %q (720p, since 1080p isn't in the ladder)", got, want)
+	}
+}
+
+func TestResolveHLSRenditionPassesThroughNonMaster(t *testing.T) {
+	// Not a master playlist: no #EXT-X-STREAM-INF lines (already a single
+	// rendition, e.g. someone pointed straight at 720p.m3u8).
+	rendition := `#EXTM3U
+#EXT-X-VERSION:3
+#EXTINF:6.0,
+seg000.ts
+#EXT-X-ENDLIST
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "720p.m3u8")
+	if err := os.WriteFile(path, []byte(rendition), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := resolveHLSRendition(path); got != path {
+		t.Errorf("resolveHLSRendition(rendition-level playlist) = %q, want unchanged %q", got, path)
+	}
+
+	// Not even an m3u8.
+	mp4 := filepath.Join(dir, "movie.mp4")
+	if got := resolveHLSRendition(mp4); got != mp4 {
+		t.Errorf("resolveHLSRendition(mp4) = %q, want unchanged", got)
+	}
+}
+
+// TestProcessThumbAtRetargetsMasterPlaylist is the regression test for a
+// production failure: pointing --thumb-at at an already-published job's
+// master playlist.m3u8 (fetched via source_server input resolution) made
+// ffmpeg fail with "could not seek to position 10.000" / "does not contain
+// any stream", because a master playlist has no duration or decodable
+// stream of its own. Process must retarget the ffmpeg -i argument at one
+// real rendition (preferring 1080p) before running.
+func TestProcessThumbAtRetargetsMasterPlaylist(t *testing.T) {
+	mediautil.WorkRoot = t.TempDir()
+	srcDir := t.TempDir()
+	master := filepath.Join(srcDir, "playlist.m3u8")
+	if err := os.WriteFile(master, []byte(realMasterPlaylist), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fake := ffexec.NewFake(core.Result{ExitCode: 0}, nil)
+	in := core.TaskInput{
+		TaskID:   "t3c",
+		InputRef: "s3://in/movie.mp4",
+		InputURI: master,
+		Params:   map[string]any{"thumb_at": float64(10)},
+		Executor: fake,
+	}
+	if _, err := (&Plugin{}).Process(context.Background(), in); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	args := fake.RecordedArgs()
+	if len(args) != 1 {
+		t.Fatalf("expected a single ffmpeg exec, got %d", len(args))
+	}
+	want := filepath.Join(srcDir, "1080p.m3u8")
+	found := false
+	for i, a := range args[0] {
+		if a == "-i" && i+1 < len(args[0]) {
+			if args[0][i+1] != want {
+				t.Errorf("-i argument = %q, want %q (not the master playlist)", args[0][i+1], want)
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no -i argument found in argv: %v", args[0])
 	}
 }
 

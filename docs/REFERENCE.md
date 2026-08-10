@@ -217,6 +217,16 @@ Global flags (may appear before or after the subcommand): `--api <url>`,
 | `--forced` | Mark this subtitle track `FORCED=YES` (`--profile subtitle-add`; ignored otherwise). |
 | `--default` | Mark this subtitle track `DEFAULT=YES` (`--profile subtitle-add`; ignored otherwise). |
 
+`--thumb-at`/`--thumb-count` accept a master HLS playlist as input too (e.g.
+grabbing a thumbnail from an already-published job via `source_server` +
+`input_ref`) — ffmpeg can't `-ss` seek into a master playlist (no duration
+of its own, only references to per-rendition sub-playlists), so the
+thumbnail plugin auto-retargets to one real rendition first, preferring
+1080p → 720p → 480p → 360p (falls back to the widest available RESOLUTION
+for a non-standard ladder). Pointing directly at a rendition-level
+`.m3u8` (or at the original source file) is unaffected and always preferred
+when available.
+
 ### `storage add` options
 
 ```

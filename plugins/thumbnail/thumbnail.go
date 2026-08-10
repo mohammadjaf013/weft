@@ -5,6 +5,7 @@ package thumbnail
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -30,6 +31,12 @@ func (p *Plugin) Process(ctx context.Context, in core.TaskInput) (core.TaskOutpu
 	if in.InputURI == "" {
 		return core.TaskOutput{}, fmt.Errorf("thumbnail: no input resolved for %s", in.InputRef)
 	}
+	// A master HLS playlist (e.g. a published job's playlist.m3u8, grabbed
+	// via source_server input fetching) has no single duration and no
+	// directly decodable stream of its own -- ffmpeg can't -ss seek into it
+	// ("could not seek to position ...") and errors with "does not contain
+	// any stream". Retarget to one real rendition sub-playlist instead.
+	in.InputURI = resolveHLSRendition(in.InputURI)
 	outDir, err := mediautil.EnsureWorkDir(in)
 	if err != nil {
 		return core.TaskOutput{}, err
@@ -234,3 +241,85 @@ func parseSize(s string) (int, int) {
 
 // everySeconds is the interval between per-second stills (legacy behavior).
 const everySeconds = 5
+
+// hlsVariant is one #EXT-X-STREAM-INF entry from a master playlist: the
+// rendition sub-playlist it points at, plus its RESOLUTION width (0 if the
+// attribute was missing) for the no-labeled-match fallback.
+type hlsVariant struct {
+	uri   string
+	width int
+}
+
+// hlsRenditionPreference is weft's own rendition-label convention (see
+// mediautil.MasterPlaylistCodec's ladder rungs) in best-first order, used to
+// pick a rendition when grabbing a thumbnail from an already-published HLS
+// master playlist: prefer 1080p, fall back to 720p, and so on.
+var hlsRenditionPreference = []string{"1080p", "720p", "480p", "360p"}
+
+// resolveHLSRendition rewrites a master HLS playlist input to one real
+// rendition sub-playlist. ffmpeg cannot -ss seek into a master playlist (it
+// has no duration of its own, only references to per-variant sub-playlists),
+// so a thumbnail request against one fails with "could not seek to position
+// ..." / "does not contain any stream". Any input that isn't a master
+// playlist (not .m3u8, or an .m3u8 already at the rendition level with no
+// #EXT-X-STREAM-INF lines -- e.g. someone already pointed at 720p.m3u8
+// directly) passes through unchanged.
+func resolveHLSRendition(inputPath string) string {
+	if !strings.EqualFold(filepath.Ext(inputPath), ".m3u8") {
+		return inputPath
+	}
+	data, err := os.ReadFile(inputPath)
+	if err != nil {
+		return inputPath // let ffmpeg surface the real "file not found" error
+	}
+	variants := parseMasterVariants(string(data))
+	if len(variants) == 0 {
+		return inputPath
+	}
+	return filepath.Join(filepath.Dir(inputPath), bestHLSVariant(variants))
+}
+
+// parseMasterVariants extracts the rendition URI (and RESOLUTION width, if
+// present) following each #EXT-X-STREAM-INF line. Returns nil for a
+// playlist with no such lines (i.e. not a master playlist).
+func parseMasterVariants(m3u8 string) []hlsVariant {
+	lines := strings.Split(strings.ReplaceAll(m3u8, "\r\n", "\n"), "\n")
+	var out []hlsVariant
+	for i, raw := range lines {
+		l := strings.TrimSpace(raw)
+		if !strings.HasPrefix(l, "#EXT-X-STREAM-INF:") || i+1 >= len(lines) {
+			continue
+		}
+		uri := strings.TrimSpace(lines[i+1])
+		if uri == "" || strings.HasPrefix(uri, "#") {
+			continue
+		}
+		w := 0
+		if idx := strings.Index(l, "RESOLUTION="); idx >= 0 {
+			var h int
+			fmt.Sscanf(l[idx+len("RESOLUTION="):], "%dx%d", &w, &h)
+		}
+		out = append(out, hlsVariant{uri: uri, width: w})
+	}
+	return out
+}
+
+// bestHLSVariant picks by hlsRenditionPreference first (matching weft's own
+// "{label}.m3u8" naming), then falls back to the widest RESOLUTION for a
+// non-standard ladder.
+func bestHLSVariant(variants []hlsVariant) string {
+	for _, label := range hlsRenditionPreference {
+		for _, v := range variants {
+			if strings.Contains(strings.ToLower(v.uri), label) {
+				return v.uri
+			}
+		}
+	}
+	best := variants[0]
+	for _, v := range variants[1:] {
+		if v.width > best.width {
+			best = v
+		}
+	}
+	return best.uri
+}
