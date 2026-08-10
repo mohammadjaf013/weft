@@ -477,7 +477,8 @@ weft jobs create "local:/src/film.mp4"        --profile vod-h264 --destination 2
 
 ### تمیزکاری خودکار (cron داخلی)
 کانفیگ `cron` در weft.yaml به‌صورت خودکار:
-- پاکسازی داده‌های قدیمی (`cleanup.retention_hours`)
+- پاکسازی رکوردهای قدیمی دیتابیس (`cleanup.retention_hours`)
+- اگه `cleanup.delete_files: true` هم تنظیم شده باشه، علاوه بر رکورد دیتابیس، فایل سورس محلی (مثلاً زیر `/var/Source`) و پوشه‌های کاری باقی‌مونده‌ی همون job هم پاک می‌شن — پیش‌فرض خاموشه، جزئیات کامل تو `docs/REFERENCE.md` بخش Configuration
 - اجرای بنچمارک هفتگی
 - اسکن سلامت هر ۵ دقیقه
 
