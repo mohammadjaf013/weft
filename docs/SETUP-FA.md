@@ -307,6 +307,7 @@ cat /opt/weft/data/Series-Test/movie1/movie_master.m3u8
 |---|---|---|
 | `vod-h264` | ویدیو | HLS ۴ رندیشن + thumbnail + زیرنویس + master + آپلود |
 | `vod-hevc` | ویدیو | مثل بالا با کدک HEVC |
+| `vod-encode` | ویدیو | مثل `vod-h264` بدون زیرنویس/AI زیرنویس: HLS ۴ رندیشن + thumbnail + master + آپلود |
 | `audio` | صوتی | m4a + آپلود |
 | `audio-hls` | صوتی | m4a + HLS صوتی (m3u8 + ts) + آپلود |
 | `thumbnail` | ویدیو | poster + sprite + vtt + آپلود |

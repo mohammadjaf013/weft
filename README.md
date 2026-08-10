@@ -32,7 +32,7 @@ Media pipelines are fragile. Weft is designed as a **durable agent**: every stat
 
 ## Features
 
-- **DAG job pipelines** — profiles define task graphs (`vod-h264`, `audio`, `thumbnail`, `subtitle-add`, `dub-add`, `trim-update`, `poster-replace`, `ai-subtitle`); tasks run when all dependencies complete.
+- **DAG job pipelines** — profiles define task graphs (`vod-h264`, `vod-encode`, `audio`, `thumbnail`, `subtitle-add`, `dub-add`, `trim-update`, `poster-replace`, `ai-subtitle`); tasks run when all dependencies complete.
 - **Durable event sourcing** — SQLite (WAL) store; every transition, event, and matching webhook outbox row commits atomically in one transaction.
 - **Crash recovery** — workers lease tasks; expired leases are re-queued. No loss, no double-publish.
 - **Priority queues** — `emergency → high → normal → low → background`, changeable on a queued job at runtime (`weft jobs priority`).
@@ -103,8 +103,8 @@ weft jobs asset <job_id> thumbnails/<base>_thumb_01.jpg
 - Either or both of `--trim-start`/`--trim-end` may be set; both are applied to
   the `hls` **and** `thumbnail` tasks so the poster stills match the trimmed window.
 - `--thumb-count` requires a profile that runs the `thumbnail` task (e.g.
-  `vod-h264`, `vod-hevc`, `thumbnail`); thumbnails are uploaded to storage and
-  listed under `assets` in `GET /jobs/{id}`.
+  `vod-h264`, `vod-hevc`, `vod-encode`, `thumbnail`); thumbnails are uploaded
+  to storage and listed under `assets` in `GET /jobs/{id}`.
 - `weft jobs asset <job_id> <name>` returns the file as a base64 data URI via
   `GET /jobs/{id}/assets/{name}`, so you can fetch a thumbnail without touching
   the storage server directly.

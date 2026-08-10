@@ -235,6 +235,72 @@ func TestJobLangAppliedToSubtitleTask(t *testing.T) {
 	}
 }
 
+// TestAutoAISubtitleDependsOnRealTask guards against the ai_subtitle task
+// being wired to a task kind that doesn't actually exist in the profile
+// (e.g. "video_encode", which vod-h264/vod-hevc never produce — the
+// encode+package step is called "hls"). A dependency on a missing task ID
+// can never be satisfied, so the job wedges forever with subtitle/upload
+// stuck pending right after hls+thumbnail finish.
+func TestAutoAISubtitleDependsOnRealTask(t *testing.T) {
+	srv, store, km := newTestServer(t)
+	// newTestServer's cfg comes from cfg.Default(), which has
+	// AI.AutoGenerate.Enabled = true, so vod-h264 (which has a subtitle
+	// task) should auto-insert an ai_subtitle task ahead of it.
+	raw, _, _ := km.Create("w", []string{"jobs:write", "jobs:read"})
+	rr := doRequest(t, srv, "POST", "/jobs", `{"input_ref":"x","profile":"vod-h264"}`, raw)
+	if rr.Code != 201 {
+		t.Fatalf("create = %d: %s", rr.Code, rr.Body.String())
+	}
+	var created map[string]any
+	json.Unmarshal(rr.Body.Bytes(), &created)
+	id := core.JobID(created["id"].(string))
+
+	tasks, err := store.ListTasks(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[core.TaskID]core.Task{}
+	for _, tk := range tasks {
+		byID[tk.ID] = tk
+	}
+
+	var ai, sub *core.Task
+	for i := range tasks {
+		switch tasks[i].Kind {
+		case "ai_subtitle":
+			ai = &tasks[i]
+		case "subtitle":
+			sub = &tasks[i]
+		}
+	}
+	if ai == nil {
+		t.Fatal("vod-h264 with auto_generate on should have an ai_subtitle task")
+	}
+	if len(ai.DependsOn) == 0 {
+		t.Fatal("ai_subtitle task has no dependencies; it will never become ready")
+	}
+	for _, dep := range ai.DependsOn {
+		if dep == "" {
+			t.Fatal("ai_subtitle depends on an empty task ID; it can never be satisfied")
+		}
+		if _, ok := byID[dep]; !ok {
+			t.Fatalf("ai_subtitle depends on %q, which is not a task in this job", dep)
+		}
+	}
+	if sub == nil {
+		t.Fatal("vod-h264 profile has no subtitle task")
+	}
+	found := false
+	for _, dep := range sub.DependsOn {
+		if dep == ai.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("subtitle task does not depend on the inserted ai_subtitle task")
+	}
+}
+
 func TestJobProviderAppliedToAISubtitleTask(t *testing.T) {
 	srv, store, km := newTestServer(t)
 	raw, _, _ := km.Create("w", []string{"jobs:write", "jobs:read"})

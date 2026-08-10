@@ -100,6 +100,7 @@ data/job_xxxx/film_preview.vtt      ← فهرست زمانی thumbnail ها
 |---|---|---|
 | `vod-h264` | mp4/mkv/mov/… | HLS 4 رندیشن (360/480/720/1080p) + thumbnail + زیرنویس + master + آپلود |
 | `vod-hevc` | mp4/mkv/mov/… | مثل بالا با کدک HEVC |
+| `vod-encode` | mp4/mkv/mov/… | مثل `vod-h264` بدون زیرنویس/AI زیرنویس: HLS 4 رندیشن + thumbnail + master + آپلود |
 | `audio` | mp3/m4a/wav/flac/… | m4a + آپلود |
 | `audio-hls` | mp3/m4a/wav/flac/… | m4a + HLS صوتی (m3u8 + ts) + آپلود |
 | `thumbnail` | ویدیو | poster + sprite + vtt + آپلود |

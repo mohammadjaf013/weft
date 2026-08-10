@@ -134,6 +134,51 @@ func TestBuildTaskGraphAudioHLS(t *testing.T) {
 	}
 }
 
+func TestBuildTaskGraphVodEncodeHasNoSubtitle(t *testing.T) {
+	// vod-encode: same as vod-h264 minus subtitle (and therefore no
+	// ai_subtitle auto-insertion, which only triggers off a "subtitle" node).
+	p, err := Get("vod-encode")
+	if err != nil {
+		t.Fatalf("Get(vod-encode): %v", err)
+	}
+	tasks, err := p.BuildTaskGraph("job-ve")
+	if err != nil {
+		t.Fatalf("BuildTaskGraph: %v", err)
+	}
+	byKind := map[string]core.Task{}
+	for _, tk := range tasks {
+		if tk.Kind == "subtitle" || tk.Kind == "ai_subtitle" {
+			t.Fatalf("vod-encode produced a %q task, want none", tk.Kind)
+		}
+		byKind[tk.Kind] = tk
+	}
+	h, hasH := byKind["hls"]
+	if !hasH {
+		t.Fatal("missing hls task")
+	}
+	th, hasTh := byKind["thumbnail"]
+	if !hasTh {
+		t.Fatal("missing thumbnail task")
+	}
+	up, hasUp := byKind["upload"]
+	if !hasUp {
+		t.Fatal("missing upload task")
+	}
+	if len(th.DependsOn) != 1 || th.DependsOn[0] != h.ID {
+		t.Errorf("thumbnail deps = %v, want [%s]", th.DependsOn, h.ID)
+	}
+	if len(up.DependsOn) != 2 {
+		t.Errorf("upload deps = %v, want 2 (hls, thumbnail)", up.DependsOn)
+	}
+	got := map[core.TaskID]bool{}
+	for _, d := range up.DependsOn {
+		got[d] = true
+	}
+	if !got[h.ID] || !got[th.ID] {
+		t.Errorf("upload deps = %v, want [%s %s]", up.DependsOn, h.ID, th.ID)
+	}
+}
+
 func TestTaskIDsUnique(t *testing.T) {
 	p, _ := Get("vod-h264")
 	tasks, _ := p.BuildTaskGraph("job-3")

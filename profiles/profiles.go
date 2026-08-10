@@ -44,6 +44,19 @@ var Profiles = map[string]Profile{
 			"hls": {"ladder": []string{"360p", "480p", "720p", "1080p"}},
 		},
 	},
+	"vod-encode": {
+		Name:        "vod-encode",
+		Description: "H.264 HLS: 360p/480p/720p/1080p renditions, thumbnails, upload — no subtitle/ai_subtitle",
+		TaskKinds:   []string{"hls", "thumbnail", "upload"},
+		Edges: []Edge{
+			{From: "hls", To: "thumbnail"},
+			{From: "thumbnail", To: "upload"},
+			{From: "hls", To: "upload"},
+		},
+		Params: map[string]map[string]any{
+			"hls": {"ladder": []string{"360p", "480p", "720p", "1080p"}},
+		},
+	},
 	"vod-hevc": {
 		Name:        "vod-hevc",
 		Description: "HEVC HLS: 360p/480p/720p/1080p renditions, thumbnails, subtitle, master playlist, upload",

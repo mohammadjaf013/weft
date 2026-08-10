@@ -636,6 +636,7 @@ lists them live.
 |---|---|---|
 | `vod-h264` | video | HLS 360/480/720/1080p + thumbnail + subtitle + master + upload |
 | `vod-hevc` | video | same, HEVC codec |
+| `vod-encode` | video | same as `vod-h264` minus subtitle/ai_subtitle: HLS 360/480/720/1080p + thumbnail + master + upload |
 | `audio` | audio | m4a + upload |
 | `audio-hls` | audio | m4a + audio HLS (m3u8 + ts) + upload |
 | `thumbnail` | video | poster + sprite + vtt + upload |

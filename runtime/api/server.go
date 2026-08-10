@@ -591,12 +591,23 @@ func (s *Server) buildTasks(ctx context.Context, p profiles.Profile, jobID core.
 	// auto_generate is on, and the input has no subtitle track.
 	if hasKind(tasks, "subtitle") && s.cfg.AI.AutoGenerate.Enabled {
 		if !s.inputHasSubtitles(ctx, p) {
+			subIdx := -1
+			for i := range tasks {
+				if tasks[i].Kind == "subtitle" {
+					subIdx = i
+					break
+				}
+			}
+			// ai_subtitle needs the same input subtitle already depends on
+			// (whatever produces the video in this profile, e.g. "hls") —
+			// not a hardcoded kind, since no vod-h264/vod-hevc task is
+			// actually named "video_encode".
 			ai := core.Task{
 				ID:        core.TaskID(core.NewID("task_ai_subtitle")),
 				JobID:     jobID,
 				Kind:      "ai_subtitle",
 				Status:    core.TaskPending,
-				DependsOn: []core.TaskID{findKindTask(tasks, "video_encode")},
+				DependsOn: append([]core.TaskID{}, tasks[subIdx].DependsOn...),
 				Params:    map[string]any{},
 			}
 			if bp.Lang != "" {
@@ -608,12 +619,9 @@ func (s *Server) buildTasks(ctx context.Context, p profiles.Profile, jobID core.
 			if bp.SrcLang != "" {
 				ai.Params["src_lang"] = bp.SrcLang
 			}
-			// subtitle depends on ai_subtitle now; ai_subtitle depends on video
-			for i := range tasks {
-				if tasks[i].Kind == "subtitle" {
-					tasks[i].DependsOn = append(tasks[i].DependsOn, ai.ID)
-				}
-			}
+			// subtitle depends on ai_subtitle now; ai_subtitle depends on
+			// whatever subtitle originally depended on.
+			tasks[subIdx].DependsOn = append(tasks[subIdx].DependsOn, ai.ID)
 			tasks = append(tasks, ai)
 		}
 	}
@@ -635,15 +643,6 @@ func hasKind(tasks []core.Task, kind string) bool {
 		}
 	}
 	return false
-}
-
-func findKindTask(tasks []core.Task, kind string) core.TaskID {
-	for _, t := range tasks {
-		if t.Kind == kind {
-			return t.ID
-		}
-	}
-	return ""
 }
 
 type taskDTO struct {
