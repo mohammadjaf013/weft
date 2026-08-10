@@ -60,10 +60,14 @@ func (p *Plugin) Process(ctx context.Context, in core.TaskInput) (core.TaskOutpu
 	sprite := fmt.Sprintf("%s/%s_sprite.jpg", outDir, base)
 	vtt := fmt.Sprintf("%s/%s_preview.vtt", outDir, base)
 
-	// Poster at 10% of duration.
+	// Poster at 10% of duration. -update 1 is required on modern ffmpeg
+	// builds: the image2 muxer refuses to write a single frame to a
+	// non-pattern filename ("...does not contain an image sequence
+	// pattern...") without it — -frames:v 1 alone isn't enough.
 	posterArgs := []string{"-i", in.InputURI,
 		"-vf", "thumbnail=100,scale=480:270",
 		"-frames:v", "1",
+		"-update", "1",
 		poster,
 	}
 	in.Params["argv"] = trimInsert(trim, posterArgs)
@@ -85,6 +89,7 @@ func (p *Plugin) Process(ctx context.Context, in core.TaskInput) (core.TaskOutpu
 	spriteArgs := []string{"-i", in.InputURI,
 		"-vf", fmt.Sprintf("fps=%s,tile=5x5,scale=1280:720", spriteFPS),
 		"-frames:v", "1",
+		"-update", "1",
 		sprite,
 	}
 	in.Params["argv"] = trimInsert(trim, spriteArgs)
@@ -180,7 +185,9 @@ func (p *Plugin) stillThumbs(ctx context.Context, in core.TaskInput, outDir, bas
 // timestamp, not a trim-relative one.
 func (p *Plugin) singleThumb(ctx context.Context, in core.TaskInput, outDir, base string, at float64) (core.TaskOutput, error) {
 	dest := fmt.Sprintf("%s/%s_thumb_at.jpg", outDir, base)
-	args := []string{"-ss", fmt.Sprintf("%.3f", at), "-i", in.InputURI, "-frames:v", "1"}
+	// -update 1: same reason as the poster/sprite outputs above — the image2
+	// muxer needs it to write a single frame to a non-pattern filename.
+	args := []string{"-ss", fmt.Sprintf("%.3f", at), "-i", in.InputURI, "-frames:v", "1", "-update", "1"}
 	if sz, _ := in.Params["thumb_size"].(string); sz != "" && sz != "original" {
 		if w, h := parseSize(sz); w > 0 && h > 0 {
 			args = append(args, "-vf", fmt.Sprintf("scale=%d:%d", w, h))

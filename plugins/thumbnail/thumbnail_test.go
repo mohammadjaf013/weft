@@ -48,6 +48,48 @@ func TestProcessProducesPosterSpriteVTT(t *testing.T) {
 	}
 }
 
+// TestPosterAndSpriteUseImage2Update is the regression test for a production
+// bug: modern ffmpeg's image2 muxer refuses to write a single frame to a
+// non-pattern filename ("...c731781eaf_poster.jpg") without -update 1 —
+// -frames:v 1 alone isn't enough — and errors with "does not contain an
+// image sequence pattern or a pattern is invalid". Both single-frame outputs
+// (poster, sprite) must pass -update 1 right alongside -frames:v 1.
+func TestPosterAndSpriteUseImage2Update(t *testing.T) {
+	mediautil.WorkRoot = t.TempDir()
+	fake := ffexec.NewFake(core.Result{ExitCode: 0}, nil)
+	in := core.TaskInput{
+		TaskID:   "tupd",
+		InputRef: "s3://in/movie.mp4",
+		InputURI: "local:work/movie.mp4",
+		Params:   map[string]any{},
+		Executor: fake,
+	}
+	if _, err := (&Plugin{}).Process(context.Background(), in); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	args := fake.RecordedArgs()
+	if len(args) != 3 {
+		t.Fatalf("expected 3 ffmpeg execs (poster, sprite, stills), got %d", len(args))
+	}
+	// poster (args[0]) and sprite (args[1]) are single-frame outputs to a
+	// non-pattern filename — both need -update 1.
+	for i, label := range []string{"poster", "sprite"} {
+		if !hasFlagPair(args[i], "-update", "1") {
+			t.Errorf("%s argv missing -update 1: %v", label, args[i])
+		}
+	}
+	// stills (args[2]) writes a %03d pattern — -update is not needed there.
+}
+
+func hasFlagPair(argv []string, flag, value string) bool {
+	for i, a := range argv {
+		if a == flag && i+1 < len(argv) && argv[i+1] == value {
+			return true
+		}
+	}
+	return false
+}
+
 func TestProcessWithRealStills(t *testing.T) {
 	mediautil.WorkRoot = t.TempDir()
 	fake := ffexec.NewFake(core.Result{ExitCode: 0}, nil)
@@ -195,6 +237,11 @@ func TestProcessSingleThumbAt(t *testing.T) {
 	}
 	if !frames {
 		t.Errorf("thumb_at missing -frames:v: %v", args[0])
+	}
+	// regression: image2 muxer needs -update 1 to write a single frame to a
+	// non-pattern filename (thumb_at.jpg) — see TestPosterAndSpriteUseImage2Update.
+	if !hasFlagPair(args[0], "-update", "1") {
+		t.Errorf("thumb_at missing -update 1: %v", args[0])
 	}
 	if !scale {
 		t.Errorf("thumb_at missing scale=640:360: %v", args[0])
