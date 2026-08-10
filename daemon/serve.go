@@ -85,7 +85,7 @@ func (d *Daemon) Serve(ctx context.Context) error {
 		d.wg.Add(1)
 		go func() {
 			defer d.wg.Done()
-			jobRetentionPruner(ctx, d.store, hrs, time.Hour)
+			jobRetentionPruner(ctx, d.store, hrs, time.Hour, d.cfg.Cron.Cleanup.DeleteFiles)
 		}()
 	}
 
@@ -450,9 +450,13 @@ func retentionPruner(ctx context.Context, store *sqlite.Store, retentionDays int
 
 // jobRetentionPruner periodically deletes terminal-status jobs (and their
 // tasks/events/outputs/logs) older than retentionHours so job history never
-// grows without bound. Best effort: a failed prune is logged and retried next
-// tick.
-func jobRetentionPruner(ctx context.Context, store *sqlite.Store, retentionHours int, interval time.Duration) {
+// grows without bound. When deleteFiles is true (cron.cleanup.delete_files),
+// it also deletes each about-to-be-pruned job's local source file and any
+// leftover per-task work/cache dirs, before the DB rows are removed --
+// unconditionally, ignoring job.DeleteSource, since once the DB record is
+// gone there's no longer any record to justify keeping the file around.
+// Best effort: a failed prune is logged and retried next tick.
+func jobRetentionPruner(ctx context.Context, store *sqlite.Store, retentionHours int, interval time.Duration, deleteFiles bool) {
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
 	for {
@@ -460,15 +464,34 @@ func jobRetentionPruner(ctx context.Context, store *sqlite.Store, retentionHours
 		case <-ctx.Done():
 			return
 		case <-tick.C:
-			cutoff := core.Now().Add(-time.Duration(retentionHours) * time.Hour)
-			n, err := store.PruneJobs(ctx, cutoff)
-			if err != nil {
-				log.Printf("job retention: %v", err)
-				continue
-			}
-			if n > 0 {
-				log.Printf("job retention pruned %d jobs older than %dh", n, retentionHours)
+			pruneJobsOnce(ctx, store, retentionHours, deleteFiles)
+		}
+	}
+}
+
+// pruneJobsOnce runs a single retention-prune pass: when deleteFiles is set,
+// deletes local files for jobs about to be pruned, then deletes their DB
+// rows. Split out from jobRetentionPruner's ticker loop so it's directly
+// unit-testable without waiting on a real timer.
+func pruneJobsOnce(ctx context.Context, store *sqlite.Store, retentionHours int, deleteFiles bool) {
+	cutoff := core.Now().Add(-time.Duration(retentionHours) * time.Hour)
+	if deleteFiles {
+		jobs, err := store.ListJobsOlderThan(ctx, cutoff)
+		if err != nil {
+			log.Printf("job retention: list jobs to prune: %v", err)
+		} else {
+			for _, j := range jobs {
+				deleteSourceFile(j)
+				deleteJobWorkDirs(ctx, store, mediautil.WorkRoot, j)
 			}
 		}
+	}
+	n, err := store.PruneJobs(ctx, cutoff)
+	if err != nil {
+		log.Printf("job retention: %v", err)
+		return
+	}
+	if n > 0 {
+		log.Printf("job retention pruned %d jobs older than %dh", n, retentionHours)
 	}
 }

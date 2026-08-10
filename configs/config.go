@@ -100,6 +100,12 @@ type CronCfg struct {
 		Schedule           string `yaml:"schedule"`
 		RetentionHours     int    `yaml:"retention_hours"`
 		EventRetentionDays int    `yaml:"event_retention_days"`
+		// DeleteFiles, when true, makes the retention pruner also delete each
+		// pruned job's local source file and any leftover work/cache dirs, not
+		// just its DB rows. Off by default: existing deployments that rely on
+		// retention_hours purely for DB/history cleanup must opt in explicitly
+		// before source media starts getting deleted on a schedule.
+		DeleteFiles bool `yaml:"delete_files"`
 	} `yaml:"cleanup"`
 	Benchmark struct {
 		Schedule string `yaml:"schedule"`

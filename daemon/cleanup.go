@@ -48,37 +48,52 @@ func (c *cleaner) cleanupJob(ctx context.Context, jobID core.JobID) {
 
 	// Remove the source input file when the job asked for it.
 	if job.DeleteSource {
-		src := sourcePath(job.InputRef)
-		if src != "" {
-			if fi, err := os.Stat(src); err == nil && !fi.IsDir() {
-				if err := os.Remove(src); err != nil {
-					log.Printf("cleanup: delete source %s (job %s): %v", src, jobID, err)
-				} else {
-					log.Printf("cleanup: deleted source %s (job %s)", src, jobID)
-				}
-			}
-		}
+		deleteSourceFile(job)
 	}
+	deleteJobWorkDirs(ctx, c.store, c.workRoot, job)
+}
 
-	// Remove per-task temp work dirs for the whole job.
-	tasks, err := c.store.ListTasks(ctx, jobID)
-	if err != nil {
-		log.Printf("cleanup: list tasks %s: %v", jobID, err)
+// deleteSourceFile removes a job's local source input file, if any (never
+// touches remote refs -- sourcePath returns "" for those).
+func deleteSourceFile(job core.Job) {
+	src := sourcePath(job.InputRef)
+	if src == "" {
 		return
 	}
-	for _, t := range tasks {
-		dir := filepath.Join(c.workRoot, "work", string(t.ID))
-		if err := os.RemoveAll(dir); err != nil {
-			log.Printf("cleanup: remove %s: %v", dir, err)
+	if fi, err := os.Stat(src); err == nil && !fi.IsDir() {
+		if err := os.Remove(src); err != nil {
+			log.Printf("cleanup: delete source %s (job %s): %v", src, job.ID, err)
+		} else {
+			log.Printf("cleanup: deleted source %s (job %s)", src, job.ID)
 		}
 	}
-	// Drop the now-empty work container if nothing else runs there.
-	os.Remove(filepath.Join(c.workRoot, "work"))
+}
+
+// deleteJobWorkDirs removes per-task work dirs and the per-job remote-input
+// cache dir for a job. Safe to call unconditionally/repeatedly -- os.RemoveAll
+// on an already-missing dir is a no-op. Shared by the on-completion cleaner
+// and the age-based retention pruner (jobRetentionPruner in serve.go) as a
+// safety net for jobs whose completion event was never observed, e.g. the
+// daemon restarted mid-run.
+func deleteJobWorkDirs(ctx context.Context, store *sqlite.Store, workRoot string, job core.Job) {
+	tasks, err := store.ListTasks(ctx, job.ID)
+	if err != nil {
+		log.Printf("cleanup: list tasks %s: %v", job.ID, err)
+	} else {
+		for _, t := range tasks {
+			dir := filepath.Join(workRoot, "work", string(t.ID))
+			if err := os.RemoveAll(dir); err != nil {
+				log.Printf("cleanup: remove %s: %v", dir, err)
+			}
+		}
+		// Drop the now-empty work container if nothing else runs there.
+		os.Remove(filepath.Join(workRoot, "work"))
+	}
 
 	// Remove the per-job remote-input cache (fetchFromSourceServer/fetchHTTP
 	// in serve.go), if this job ever fetched one — safe to remove
 	// unconditionally once the job's finished, regardless of DeleteSource.
-	cacheDir := filepath.Join(c.workRoot, "cache", string(jobID))
+	cacheDir := filepath.Join(workRoot, "cache", string(job.ID))
 	if err := os.RemoveAll(cacheDir); err != nil {
 		log.Printf("cleanup: remove %s: %v", cacheDir, err)
 	}

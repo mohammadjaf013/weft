@@ -507,6 +507,48 @@ func TestStoreDeleteJobCascade(t *testing.T) {
 	}
 }
 
+// TestStoreListJobsOlderThan verifies ListJobsOlderThan returns exactly the
+// set PruneJobs would delete (terminal status, created before cutoff) --
+// used by the retention pruner to clean up local files before the DB rows
+// disappear.
+func TestStoreListJobsOlderThan(t *testing.T) {
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	now := core.Now()
+	old := now.Add(-48 * time.Hour)
+	recent := now.Add(-1 * time.Hour)
+
+	cases := []core.Job{
+		{ID: "old-completed", Status: core.JobCompleted, Priority: core.PriorityNormal, CreatedAt: old},
+		{ID: "old-failed", Status: core.JobFailed, Priority: core.PriorityNormal, CreatedAt: old},
+		{ID: "old-running", Status: core.JobRunning, Priority: core.PriorityNormal, CreatedAt: old},   // not terminal
+		{ID: "recent-completed", Status: core.JobCompleted, Priority: core.PriorityNormal, CreatedAt: recent}, // too new
+	}
+	for _, j := range cases {
+		if err := store.SaveJob(ctx, j); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cutoff := now.Add(-24 * time.Hour)
+	jobs, err := store.ListJobsOlderThan(ctx, cutoff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[core.JobID]bool{}
+	for _, j := range jobs {
+		got[j.ID] = true
+	}
+	if len(got) != 2 || !got["old-completed"] || !got["old-failed"] {
+		t.Fatalf("ListJobsOlderThan = %v, want exactly {old-completed, old-failed}", got)
+	}
+}
+
 func TestStoreTaskLogRoundTrip(t *testing.T) {
 	store, err := OpenInMemory()
 	if err != nil {

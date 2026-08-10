@@ -892,6 +892,38 @@ func (s *Store) PruneEvents(ctx context.Context, olderThan time.Time) (int64, er
 // retried) older than the given cutoff, cascading the same way DeleteJob does
 // for a single job. Implements cron.cleanup.retention_hours so job history
 // doesn't accumulate forever. Returns the number of jobs removed.
+// ListJobsOlderThan returns terminal-status jobs older than cutoff -- the
+// exact same set PruneJobs is about to delete. The retention pruner calls
+// this first so it can clean up each job's local files before PruneJobs
+// removes the DB rows those files were addressed by.
+func (s *Store) ListJobsOlderThan(ctx context.Context, cutoff time.Time) ([]core.Job, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id,status,priority,profile,destination_id,dest_path,input_ref,delete_source,source_server_id,verified,error,created_at,updated_at
+		FROM jobs WHERE created_at < ? AND status IN (?,?,?,?)`,
+		ts(cutoff), string(core.JobCompleted), string(core.JobCancelled), string(core.JobFailed), string(core.JobDeadLetter))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []core.Job{}
+	for rows.Next() {
+		var j core.Job
+		var status, priority string
+		var verified, delSrc int
+		var created, updated string
+		if err := rows.Scan(&j.ID, &status, &priority, &j.Profile, &j.DestinationID, &j.DestPath, &j.InputRef, &delSrc, &j.SourceServerID, &verified, &j.Error, &created, &updated); err != nil {
+			return nil, err
+		}
+		j.Status = core.JobStatus(status)
+		j.Priority = core.Priority(priority)
+		j.Verified = verified == 1
+		j.DeleteSource = delSrc == 1
+		j.CreatedAt = parseTS(created)
+		j.UpdatedAt = parseTS(updated)
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) PruneJobs(ctx context.Context, olderThan time.Time) (int64, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

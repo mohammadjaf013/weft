@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	cfg "github.com/mohammadjaf013/weft/configs"
 	"github.com/mohammadjaf013/weft/core"
@@ -209,5 +210,113 @@ func TestStorageForLocalWithDestPath(t *testing.T) {
 		if got := lst.ResolveName("movie.mp4"); got != filepath.Join(base, c.want) {
 			t.Errorf("path %q: resolve = %q, want %q", c.path, got, filepath.Join(base, c.want))
 		}
+	}
+}
+
+// TestPruneJobsOnceDeletesFilesWhenEnabled verifies cron.cleanup.delete_files
+// makes the retention pruner remove a pruned job's local source file and its
+// leftover work dir, in addition to the DB rows -- and that a *recent* job
+// (inside the retention window) is left untouched. deleteFiles=false must
+// leave both files in place even though the job itself still gets pruned
+// from the DB (existing DB-only behavior, unchanged).
+func TestPruneJobsOnceDeletesFilesWhenEnabled(t *testing.T) {
+	root := t.TempDir()
+	store, err := sqlite.Open(filepath.Join(root, "weft.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	workRoot := filepath.Join(root, "workroot")
+	mediautil.WorkRoot = workRoot
+
+	src := filepath.Join(root, "old-movie.mp4")
+	if err := os.WriteFile(src, []byte("media"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	workDir := filepath.Join(workRoot, "work", "task_old_hls")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workDir, "seg.ts"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	old := core.Now().Add(-48 * time.Hour)
+	// DeleteSource is intentionally false here -- retention-based file
+	// deletion must not depend on it once the DB record is about to go away.
+	if err := store.SaveJob(ctx, core.Job{
+		ID: "old-job", Status: core.JobCompleted, Priority: core.PriorityNormal,
+		InputRef: "local:" + filepath.ToSlash(src), DeleteSource: false, CreatedAt: old,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveTask(ctx, core.Task{ID: "task_old_hls", JobID: "old-job", Kind: "hls"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A recent job's source must survive the same pass.
+	recentSrc := filepath.Join(root, "recent-movie.mp4")
+	if err := os.WriteFile(recentSrc, []byte("media"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveJob(ctx, core.Job{
+		ID: "recent-job", Status: core.JobCompleted, Priority: core.PriorityNormal,
+		InputRef: "local:" + filepath.ToSlash(recentSrc), CreatedAt: core.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	pruneJobsOnce(ctx, store, 24, true)
+
+	if _, err := os.Stat(src); !os.IsNotExist(err) {
+		t.Errorf("old source not deleted: %v", err)
+	}
+	if _, err := os.Stat(workDir); !os.IsNotExist(err) {
+		t.Errorf("old work dir not deleted: %v", err)
+	}
+	if _, err := store.LoadJob(ctx, "old-job"); err == nil {
+		t.Error("old job record still present after prune")
+	}
+	if _, err := os.Stat(recentSrc); err != nil {
+		t.Errorf("recent source should survive: %v", err)
+	}
+	if _, err := store.LoadJob(ctx, "recent-job"); err != nil {
+		t.Errorf("recent job should survive: %v", err)
+	}
+}
+
+// TestPruneJobsOnceLeavesFilesWhenDisabled verifies the pre-existing
+// DB-only behavior is preserved when cron.cleanup.delete_files is unset:
+// the job record is pruned but its source file is left on disk.
+func TestPruneJobsOnceLeavesFilesWhenDisabled(t *testing.T) {
+	root := t.TempDir()
+	store, err := sqlite.Open(filepath.Join(root, "weft.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	src := filepath.Join(root, "movie.mp4")
+	if err := os.WriteFile(src, []byte("media"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := core.Now().Add(-48 * time.Hour)
+	if err := store.SaveJob(ctx, core.Job{
+		ID: "old-job", Status: core.JobCompleted, Priority: core.PriorityNormal,
+		InputRef: "local:" + filepath.ToSlash(src), CreatedAt: old,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	pruneJobsOnce(ctx, store, 24, false)
+
+	if _, err := os.Stat(src); err != nil {
+		t.Errorf("source should survive when delete_files is disabled: %v", err)
+	}
+	if _, err := store.LoadJob(ctx, "old-job"); err == nil {
+		t.Error("old job record still present after prune")
 	}
 }

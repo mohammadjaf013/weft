@@ -132,8 +132,13 @@ ai_subtitle:
 cron:
   cleanup:
     schedule: "0 3 * * *"      # daily 03:00
-    retention_hours: 72        # how long to keep work dirs
+    retention_hours: 72        # how long to keep terminal-status job DB rows
     event_retention_days: 30   # how long to keep the event log
+    delete_files: false        # also delete each pruned job's local source
+                                # file + leftover work/cache dirs, not just
+                                # its DB rows -- off by default; set true to
+                                # age-clean a source-upload directory (e.g.
+                                # /var/Source) alongside retention_hours
   benchmark:
     schedule: "0 4 * * 0"      # weekly Sunday 04:00
   health_scan:
@@ -496,7 +501,11 @@ outcomes.
 `cleanup` prunes terminal-status jobs past `cron.cleanup.retention_hours` and
 events past `cron.cleanup.event_retention_days` (in addition to the
 always-on hourly interval pruners — the cron entry is what makes this
-inspectable/triggerable by hand, not a second independent mechanism).
+inspectable/triggerable by hand, not a second independent mechanism). When
+`cron.cleanup.delete_files` is also set, each pruned job's local source file
+and any leftover per-task work/cache dirs are deleted too — unconditionally,
+ignoring the job's own `--delete-source` flag, since once the DB record is
+gone there's no longer anything to keep the file for.
 `benchmark` re-runs the node benchmark. `health_scan` samples host resources
 and publishes a `node.health` webhook event — raw data collection; a
 composite Health Score on top of these samples is a future refinement, not
