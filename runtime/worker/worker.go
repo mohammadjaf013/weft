@@ -165,7 +165,14 @@ func (w *Worker) cycle(ctx context.Context) error {
 		defer w.opts.Budget.Release(cpu, ramMB)
 	}
 
-	// reserve a lease
+	// reserve a lease. reserve() sets currentTask before it's actually sure
+	// the claim/transition succeeds, and both it and execute() have several
+	// early-return error paths (store errors, failed state transitions,
+	// storage resolution) that don't individually clear it -- this defer is
+	// the single place that guarantees currentTask always goes back to ""
+	// once this cycle is done, however it ends, so a transient error never
+	// leaves the worker reporting "busy" forever with nothing to show for it.
+	defer w.setCurrentTask("")
 	reserved, err := w.reserve(ctx, *task)
 	if err != nil {
 		return err

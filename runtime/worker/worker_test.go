@@ -267,6 +267,58 @@ func TestWorkerFailsJobOnPluginError(t *testing.T) {
 	}
 }
 
+// TestWorkerClearsCurrentTaskOnExecuteError is the regression test for a
+// production dashboard showing "workers: 3/40 busy" alongside "no active
+// jobs": reserve()/execute() call setCurrentTask(taskID) up front, but had
+// several early-return error paths (job load, storage resolution, failed
+// state transitions, ...) that never cleared it back to "" -- so a single
+// transient error left a worker permanently reporting "busy" with nothing
+// actually running, until the process restarted. cycle() must clear
+// currentTask no matter how reserve/execute return.
+func TestWorkerClearsCurrentTaskOnExecuteError(t *testing.T) {
+	store, err := sqlite.OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	bus := core.NewEventBus()
+	defer bus.Close()
+	sm := core.NewStateMachine(store, bus)
+	sched := core.NewDAGScheduler(store, bus, sm)
+	ctx := context.Background()
+
+	job := core.Job{ID: "ju", Status: core.JobQueued, Priority: core.PriorityNormal, Profile: "test"}
+	if err := store.SaveJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveTask(ctx, core.Task{ID: "tu", JobID: "ju", Kind: "upload", Status: core.TaskPending}); err != nil {
+		t.Fatal(err)
+	}
+
+	w := New("worker-1", Options{
+		Store:    store,
+		Bus:      bus,
+		Sched:    sched,
+		SM:       sm,
+		Registry: registry.New(),
+		Executor: fakeExec{},
+		LeaseTTL: time.Minute,
+		Interval: 10 * time.Millisecond,
+		// Fails at the storage-resolution step inside execute() -- one of
+		// several early-return paths that used to leak currentTask.
+		Storage: func(job core.Job) (core.Storage, error) {
+			return nil, errors.New("storage unavailable")
+		},
+	})
+
+	if err := w.cycle(ctx); err == nil {
+		t.Fatal("expected cycle() to surface the storage error")
+	}
+	if got := w.CurrentTask(); got != "" {
+		t.Errorf("CurrentTask() = %q after a failed execute(), want \"\" -- worker stuck reporting busy forever", got)
+	}
+}
+
 func TestWorkerParallelDAG(t *testing.T) {
 	e := newWorkerEnv(t,
 		&testPlugin{name: "video", kinds: []string{"video_encode"}},
